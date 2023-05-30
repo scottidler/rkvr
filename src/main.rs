@@ -10,8 +10,6 @@ use std::io::Write;
 use std::env;
 use std::fs;
 
-//use walkdir::WalkDir;
-
 fn execute<T: AsRef<str>>(sudo: bool, args: &[T]) -> Output {
     let mut args: Vec<String> = args.iter().map(|arg| arg.as_ref().to_owned()).collect();
     if sudo {
@@ -23,50 +21,6 @@ fn execute<T: AsRef<str>>(sudo: bool, args: &[T]) -> Output {
     }
     command.output().expect("failed to execute process")
 }
-
-/*
-fn find_files_with_extension(dir_path: &Path, extension: &str) -> Vec<String> {
-    let mut result = vec![];
-
-    if let Ok(entries) = fs::read_dir(dir_path) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if path.is_file() && path.extension().unwrap() == extension {
-                    result.push(path.to_string_lossy().into_owned());
-                }
-            }
-        }
-    }
-
-    result
-}
-
-fn find_files_older_than(dir_path: &Path, days: i32) -> Vec<String> {
-    let now = SystemTime::now();
-    let duration = std::time::Duration::from_secs((days * 24 * 60 * 60) as u64);
-    let cutoff = now - duration;
-
-    let mut result = vec![];
-
-    if let Ok(entries) = fs::read_dir(dir_path) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if let Ok(metadata) = fs::metadata(&path) {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified < cutoff {
-                            result.push(path.to_string_lossy().into_owned());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    result
-}
-*/
 
 // make a name from the basename of the path
 fn make_name(path: &Path) -> Result<String> {
@@ -87,24 +41,6 @@ fn make_name(path: &Path) -> Result<String> {
     }
 }
 
-
-/*
-fn list_dir(path: &str) -> std::io::Result<()> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        println!("{:?} {} {}", metadata.permissions(), metadata.modified()?, entry.path().display());
-    }
-    Ok(())
-}
-
-fn print_dir_tree(path: &str) {
-    for entry in WalkDir::new(path) {
-        let entry = entry.unwrap();
-        println!("{}", entry.path().display());
-    }
-}
-*/
 
 #[derive(Parser, Debug, Default, Clone)]
 #[command(name = "rkvr", about = "tool for staging rmrf-ing or bkup-ing files")]
@@ -158,14 +94,14 @@ impl Rkvr {
         /*
         ❯ bat -p ~/.config/rkvr/rkvr.cfg
         [rmrf]
-        path=/var/tmp/rmrf/
+        path=/var/tmp/rkvr/rmrf/
 
         sudo=true
 
         keep=21
 
         [bkup]
-        path=/var/tmp/bkup/
+        path=/var/tmp/rkvr/bkup/
 
         sudo=true
         */
@@ -174,10 +110,10 @@ impl Rkvr {
         let rkvr_path = expanduser(rkvr_cfg)?;
         let mut rkvr_cfg = Ini::new();
         rkvr_cfg.load(&rkvr_path).map_err(|e| eyre!(e))?;
-        let rmrf_path = rkvr_cfg.get("rmrf", "path").unwrap_or("/var/tmp/rmrf".to_owned());
+        let rmrf_path = rkvr_cfg.get("rmrf", "path").unwrap_or("/var/tmp/rkvr/rmrf".to_owned());
         let rmrf_sudo: bool = rkvr_cfg.get("rmrf", "sudo").unwrap_or("true".to_owned()) == "true";
         let rmrf_keep: usize = rkvr_cfg.get("rmrf", "keep").unwrap_or("21".to_owned()).parse().unwrap();
-        let bkup_path = rkvr_cfg.get("bkup", "path").unwrap_or("/var/tmp/bkup".to_owned());
+        let bkup_path = rkvr_cfg.get("bkup", "path").unwrap_or("/var/tmp/rkvr/bkup".to_owned());
         let bkup_sudo: bool = rkvr_cfg.get("bkup", "sudo").unwrap_or("true".to_owned()) == "true";
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)?
@@ -202,11 +138,12 @@ impl Rkvr {
     // - metadata file with the output of the ls command for items that are files, tree for items that are directories
     // the metadata file will have the fully qualified path of the item, then a colon:
     // then the output of the ls or tree command on a new line, indented by two spaces
+    // note: if output as multiple lines with newlines, every line should be indented by the two spaces
     fn archive(&self, items: &[String], path: &str, sudo: bool) -> Result<()> {
         let timestamp_path = format!("{}/{}", path, self.timestamp);
         let timestamp_path = Path::new(&timestamp_path);
         fs::create_dir_all(&timestamp_path).map_err(|e| eyre!(e))?;
-
+    
         // Collect all matching items in the current working directory.
         let cwd_items: Vec<_> = items.iter().filter_map(|item| {
             let item_path = self.cwd.join(item);
@@ -216,41 +153,102 @@ impl Rkvr {
                 None
             }
         }).collect();
-
+    
         if cwd_items.is_empty() {
             return Ok(());
         }
-
+    
         // Archive the items.
         let archive_path = timestamp_path.join("archive.tar.gz");
         let tar_gz = fs::File::create(&archive_path)?;
         let enc = flate2::write::GzEncoder::new(tar_gz, flate2::Compression::default());
         let mut tar = tar::Builder::new(enc);
         for item in &cwd_items {
-            tar.append_path(item)?;
+            // Get the relative path from current directory
+            let relative_path = item.strip_prefix(&self.cwd)?;
+            tar.append_path(relative_path)?;
         }
         tar.into_inner()?.finish()?;
-
+    
         // Create metadata files.
-        for item in cwd_items {
+        for item in &cwd_items {
             let metadata_path = timestamp_path.join(format!("{}.metadata", make_name(&item)?));
             let mut metadata_file = fs::File::create(metadata_path)?;
-
+    
             let output = if item.is_dir() {
                 execute(sudo, &["tree", "-l", item.to_str().unwrap()])
             } else {
                 execute(sudo, &["ls", "-l", item.to_str().unwrap()])
             };
-
+    
             if !output.stderr.is_empty() {
                 return Err(eyre!(String::from_utf8_lossy(&output.stderr).to_string()));
             }
-
-            write!(metadata_file, "{}:\n  {}\n", item.to_string_lossy(), String::from_utf8_lossy(&output.stdout))?;
+    
+            // Split the output into lines, indent each line by 2 spaces, and then join them back together
+            let indented_output = output.stdout
+                .split('\n')
+                .map(|line| format!("  {}", line))
+                .collect::<Vec<_>>()
+                .join("\n");
+    
+            write!(metadata_file, "{}:\n{}\n", item.to_string_lossy(), indented_output)?;
         }
-
+    
         Ok(())
     }
+    
+    // fn archive(&self, items: &[String], path: &str, sudo: bool) -> Result<()> {
+    //     let timestamp_path = format!("{}/{}", path, self.timestamp);
+    //     let timestamp_path = Path::new(&timestamp_path);
+    //     fs::create_dir_all(&timestamp_path).map_err(|e| eyre!(e))?;
+    
+    //     // Collect all matching items in the current working directory.
+    //     let cwd_items: Vec<_> = items.iter().filter_map(|item| {
+    //         let item_path = self.cwd.join(item);
+    //         if item_path.exists() {
+    //             Some(item_path)
+    //         } else {
+    //             None
+    //         }
+    //     }).collect();
+    
+    //     if cwd_items.is_empty() {
+    //         return Ok(());
+    //     }
+
+    //     // Archive the items.
+    //     let archive_path = timestamp_path.join("archive.tar.gz");
+    //     let tar_gz = fs::File::create(&archive_path)?;
+    //     let enc = flate2::write::GzEncoder::new(tar_gz, flate2::Compression::default());
+    //     let mut tar = tar::Builder::new(enc);
+    //     for item in &cwd_items {
+    //         // Get the relative path from current directory
+    //         let relative_path = item.strip_prefix(&self.cwd)?;
+    //         tar.append_path(relative_path)?;
+    //     }
+    //     tar.into_inner()?.finish()?;
+    
+    //     // Create metadata files.
+    //     for item in cwd_items {
+    //         let metadata_path = timestamp_path.join(format!("{}.metadata", make_name(&item)?));
+    //         let mut metadata_file = fs::File::create(metadata_path)?;
+    
+    //         let output = if item.is_dir() {
+    //             execute(sudo, &["tree", "-l", item.to_str().unwrap()])
+    //         } else {
+    //             execute(sudo, &["ls", "-l", item.to_str().unwrap()])
+    //         };
+    
+    //         if !output.stderr.is_empty() {
+    //             return Err(eyre!(String::from_utf8_lossy(&output.stderr).to_string()));
+    //         }
+    
+    //         write!(metadata_file, "{}:\n  {}\n", item.to_string_lossy(), String::from_utf8_lossy(&output.stdout))?;
+    //     }
+    
+    //     Ok(())
+    // }
 
     // patterns: list of globa patterns (item*) to match against the metadata files
     // path: fully qualified path to archive where the timestamp directories are located
