@@ -8,7 +8,7 @@ use std::process::{Command, Output};
 use std::path::{Path, PathBuf};
 use std::env;
 use std::fs;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use serde_yaml;
 use std::collections::HashMap;
 
@@ -71,7 +71,7 @@ struct Rkvr {
     cwd: PathBuf,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Metadata {
     items: HashMap<String, String>,
 }
@@ -217,7 +217,7 @@ impl Rkvr {
     // matches are inclusive, so if item one matches some pattern and item two matches some other pattern, both are returned
     // returned just means that the contents of the metadata file are printed to stdout
     // note the glob patterns are left anchored, so item* will match item1, item2, item3, etc.
-    fn list(&self, _patterns: &[String], path: &str) -> Result<()> {
+    fn list(&self, patterns: &[String], path: &str) -> Result<()> {
         let archive_path = Path::new(path);
         if !archive_path.exists() {
             return Err(eyre!("Archive path does not exist"));
@@ -236,13 +236,25 @@ impl Rkvr {
                                 // convert the path into a canonicalized path (fully qualified path)
                                 let timestamp_path_str = fs::canonicalize(timestamp_path)?.to_string_lossy().into_owned();
                                 let contents = fs::read_to_string(Path::new(&timestamp_path_str))?;
-                                let timestamp = entry_path.file_name().unwrap().to_str().unwrap();
-                                let indented_contents = contents
-                                    .lines()
-                                    .map(|line| format!("  {}", line))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                println!("{}:\n{}", timestamp, indented_contents);
+                                let metadata: Metadata = serde_yaml::from_str(&contents)?;
+
+                                let has_match = if patterns.is_empty() {
+                                    true
+                                } else {
+                                    patterns.iter().any(|pattern| {
+                                        metadata.items.keys().any(|key| key.starts_with(pattern))
+                                    })
+                                };
+
+                                if has_match {
+                                    let timestamp = entry_path.file_name().unwrap().to_str().unwrap();
+                                    let indented_contents = contents
+                                        .lines()
+                                        .map(|line| format!("  {}", line))
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    println!("{}:\n{}", timestamp, indented_contents);
+                                }
                             }
                         }
                     }
@@ -306,7 +318,6 @@ impl Rkvr {
 
         Ok(())
     }
-
 
     fn run(&self) -> Result<()> {
         let cli = RkvrCli::parse();
