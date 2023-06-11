@@ -277,7 +277,7 @@ impl Rkvr {
     // keep: number of days to keep archives (timestamp dirs in the path directory)
     // every timestamp directory that will be deleted will have the metadata file printed to stdout
     // the the entire timestamp directory will be deleted
-    fn harvest(&self, path: &str, keep: usize) -> Result<()> {
+    fn harvest(path: &str, keep: usize) -> Result<()> {
         // Convert the keep days into a Duration.
         let keep_duration = std::time::Duration::from_secs((keep * 24 * 60 * 60) as u64);
 
@@ -334,7 +334,7 @@ impl Rkvr {
                 let paths_to_remove = self.archive(&rmrf.items, &self.rmrf_path, self.rmrf_sudo)?;
                 // Remove the original files/directories after successful archiving.
                 Self::remove(paths_to_remove)?;
-                self.harvest(&self.rmrf_path, self.rmrf_keep)?;
+                Self::harvest(&self.rmrf_path, self.rmrf_keep)?;
             },
             Action::Bkup(ref bkup) => {
                 self.archive(&bkup.items, &self.bkup_path, self.bkup_sudo)?;
