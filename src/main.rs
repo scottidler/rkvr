@@ -360,7 +360,8 @@ impl Rkvr {
 
 fn main() -> Result<()> {
     let rkvr_yml = env::var("RKVR_CFG")
-        .unwrap_or("~/.config/rkvr/rkvr.yml".to_owned());
+        .unwrap_or_else(|_| "~/.config/rkvr/rkvr.yml".to_owned());
+
     let rkvr = Rkvr::new(&rkvr_yml)?;
     rkvr.run()?;
     Ok(())
