@@ -98,11 +98,13 @@ impl Rkvr {
         let rkvr_path = expanduser(rkvr_cfg)?;
         let mut rkvr_cfg = Ini::new();
         rkvr_cfg.load(&rkvr_path).map_err(|e| eyre!(e))?;
-        let rmrf_path = rkvr_cfg.get("rmrf", "path").unwrap_or("/var/tmp/rkvr/rmrf".to_owned());
-        let rmrf_sudo: bool = rkvr_cfg.get("rmrf", "sudo").unwrap_or("true".to_owned()) == "true";
-        let rmrf_keep: usize = rkvr_cfg.get("rmrf", "keep").unwrap_or("21".to_owned()).parse().unwrap();
-        let bkup_path = rkvr_cfg.get("bkup", "path").unwrap_or("/var/tmp/rkvr/bkup".to_owned());
-        let bkup_sudo: bool = rkvr_cfg.get("bkup", "sudo").unwrap_or("true".to_owned()) == "true";
+
+        let rmrf_path = rkvr_cfg.get("rmrf", "path").ok_or_else(|| eyre!("rmrf path not found"))?;
+        let rmrf_sudo = rkvr_cfg.get("rmrf", "sudo").map(|val| val == "true").ok_or_else(|| eyre!("rmrf sudo not found"))?;
+        let rmrf_keep = rkvr_cfg.get("rmrf", "keep").and_then(|val| val.parse().ok()).ok_or_else(|| eyre!("rmrf keep not found"))?;
+        let bkup_path = rkvr_cfg.get("bkup", "path").ok_or_else(|| eyre!("bkup path not found"))?;
+        let bkup_sudo = rkvr_cfg.get("bkup", "sudo").map(|val| val == "true").ok_or_else(|| eyre!("bkup sudo not found"))?;
+
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)?
             .as_secs();
@@ -164,7 +166,7 @@ impl Rkvr {
                 metadata.items.insert(item.clone(), stdout);
 
                 // Get the relative path from current directory
-                let relative_path = path.strip_prefix(&self.cwd)?;
+                let relative_path = path.strip_prefix(&self.cwd).map_err(|_| eyre!("Failed to get relative path"))?;
                 tar.append_path(relative_path)?;
 
                 paths_to_remove.push(path.clone());
@@ -231,32 +233,38 @@ impl Rkvr {
 
         for entry_path in metadata_entries {
             if entry_path.is_dir() {
-                let timestamp_entries = fs::read_dir(entry_path.clone())?;
+                let timestamp_entries = fs::read_dir(entry_path.clone()).map_err(|e| eyre!(e))?;
                 for timestamp_entry in timestamp_entries {
-                    if let Ok(timestamp_entry) = timestamp_entry {
-                        let timestamp_path = timestamp_entry.path();
-                        if timestamp_path.is_file() && timestamp_path.extension().unwrap() == "metadata" {
-                            // convert the path into a canonicalized path (fully qualified path)
-                            let timestamp_path_str = fs::canonicalize(timestamp_path)?.to_string_lossy().into_owned();
-                            let contents = fs::read_to_string(Path::new(&timestamp_path_str))?;
-                            let metadata: Metadata = serde_yaml::from_str(&contents)?;
+                    let timestamp_entry = timestamp_entry.map_err(|e| eyre!(e))?;
+                    let timestamp_path = timestamp_entry.path();
+                    if timestamp_path.is_file() && timestamp_path.extension().map_or(false, |ext| ext == "metadata") {
+                        // convert the path into a canonicalized path (fully qualified path)
+                        let timestamp_path_str = fs::canonicalize(timestamp_path)?.to_string_lossy().into_owned();
+                        let contents = fs::read_to_string(Path::new(&timestamp_path_str)).map_err(|e| eyre!(e))?;
+                        let metadata: Metadata = serde_yaml::from_str(&contents).map_err(|e| eyre!(e))?;
 
-                            let has_match = if patterns.is_empty() {
-                                true
-                            } else {
-                                patterns.iter().any(|pattern| {
-                                    metadata.items.keys().any(|key| key.starts_with(pattern))
-                                })
-                            };
+                        let has_match = if patterns.is_empty() {
+                            true
+                        } else {
+                            patterns.iter().any(|pattern| {
+                                metadata.items.keys().any(|key| key.starts_with(pattern))
+                            })
+                        };
 
-                            if has_match {
-                                let timestamp = entry_path.file_name().unwrap().to_str().unwrap();
-                                let indented_contents = contents
-                                    .lines()
-                                    .map(|line| format!("  {}", line))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                println!("{}:\n{}", timestamp, indented_contents);
+                        if has_match {
+                            match entry_path.file_name() {
+                                Some(fname) => match fname.to_str() {
+                                    Some(timestamp) => {
+                                        let indented_contents = contents
+                                            .lines()
+                                            .map(|line| format!("  {}", line))
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        println!("{}:\n{}", timestamp, indented_contents);
+                                    },
+                                    None => return Err(eyre!("Failed to convert file name to string")),
+                                },
+                                None => return Err(eyre!("Failed to get file name")),
                             }
                         }
                     }
