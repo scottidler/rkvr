@@ -223,38 +223,40 @@ impl Rkvr {
             return Err(eyre!("Archive path does not exist"));
         }
 
-        let metadata_entries = fs::read_dir(archive_path)?;
-        for entry in metadata_entries {
-            if let Ok(entry) = entry {
-                let entry_path = entry.path();
-                if entry_path.is_dir() {
-                    let timestamp_entries = fs::read_dir(entry_path.clone())?;
-                    for timestamp_entry in timestamp_entries {
-                        if let Ok(timestamp_entry) = timestamp_entry {
-                            let timestamp_path = timestamp_entry.path();
-                            if timestamp_path.is_file() && timestamp_path.extension().unwrap() == "metadata" {
-                                // convert the path into a canonicalized path (fully qualified path)
-                                let timestamp_path_str = fs::canonicalize(timestamp_path)?.to_string_lossy().into_owned();
-                                let contents = fs::read_to_string(Path::new(&timestamp_path_str))?;
-                                let metadata: Metadata = serde_yaml::from_str(&contents)?;
+        let mut metadata_entries: Vec<_> = fs::read_dir(archive_path)?
+            .map(|res| res.map(|e| e.path()).map_err(eyre::Report::from))
+            .collect::<Result<Vec<_>, eyre::Report>>()?;
 
-                                let has_match = if patterns.is_empty() {
-                                    true
-                                } else {
-                                    patterns.iter().any(|pattern| {
-                                        metadata.items.keys().any(|key| key.starts_with(pattern))
-                                    })
-                                };
+        metadata_entries.sort();  // Sort entries in lexicographical order
 
-                                if has_match {
-                                    let timestamp = entry_path.file_name().unwrap().to_str().unwrap();
-                                    let indented_contents = contents
-                                        .lines()
-                                        .map(|line| format!("  {}", line))
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-                                    println!("{}:\n{}", timestamp, indented_contents);
-                                }
+        for entry_path in metadata_entries {
+            if entry_path.is_dir() {
+                let timestamp_entries = fs::read_dir(entry_path.clone())?;
+                for timestamp_entry in timestamp_entries {
+                    if let Ok(timestamp_entry) = timestamp_entry {
+                        let timestamp_path = timestamp_entry.path();
+                        if timestamp_path.is_file() && timestamp_path.extension().unwrap() == "metadata" {
+                            // convert the path into a canonicalized path (fully qualified path)
+                            let timestamp_path_str = fs::canonicalize(timestamp_path)?.to_string_lossy().into_owned();
+                            let contents = fs::read_to_string(Path::new(&timestamp_path_str))?;
+                            let metadata: Metadata = serde_yaml::from_str(&contents)?;
+
+                            let has_match = if patterns.is_empty() {
+                                true
+                            } else {
+                                patterns.iter().any(|pattern| {
+                                    metadata.items.keys().any(|key| key.starts_with(pattern))
+                                })
+                            };
+
+                            if has_match {
+                                let timestamp = entry_path.file_name().unwrap().to_str().unwrap();
+                                let indented_contents = contents
+                                    .lines()
+                                    .map(|line| format!("  {}", line))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                println!("{}:\n{}", timestamp, indented_contents);
                             }
                         }
                     }
