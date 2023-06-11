@@ -14,4 +14,6 @@ eyre = "0.6.8"
 flate2 = "1.0.26"
 glob = "0.3.1"
 libc ="0.2.144"
+serde = { version = "1.0.164", features = ["derive"] }
+serde_yaml = "0.9.21"
 tar = "0.4.38"

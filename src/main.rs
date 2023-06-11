@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::io::Write;
 use std::env;
 use std::fs;
+use serde::Serialize;
+use serde_yaml;
 
 fn execute<T: AsRef<str>>(sudo: bool, args: &[T]) -> Output {
     let mut args: Vec<String> = args.iter().map(|arg| arg.as_ref().to_owned()).collect();
@@ -21,26 +23,6 @@ fn execute<T: AsRef<str>>(sudo: bool, args: &[T]) -> Output {
     }
     command.output().expect("failed to execute process")
 }
-
-// make a name from the basename of the path
-fn make_name(path: &Path) -> Result<String> {
-    match path.file_name() {
-        Some(file_name) => {
-            match file_name.to_str() {
-                Some(file_str) => {
-                    let mut name = file_str.to_owned();
-                    name = name.replace("/", "-");
-                    name = name.replace(":", "_");
-                    name = name.replace(" ", "_");
-                    Ok(name)
-                },
-                None => Err(eyre::eyre!("File name is not valid UTF-8")),
-            }
-        },
-        None => Err(eyre::eyre!("Path does not have a file name")),
-    }
-}
-
 
 #[derive(Parser, Debug, Default, Clone)]
 #[command(name = "rkvr", about = "tool for staging rmrf-ing or bkup-ing files")]
@@ -88,6 +70,14 @@ struct Rkvr {
     timestamp: u64,
     cwd: PathBuf,
 }
+
+
+#[derive(Serialize)]
+struct Metadata {
+    item: String,
+    output: String,
+}
+
 
 impl Rkvr {
     pub fn new(rkvr_cfg: &str) -> Result<Self> {
@@ -139,116 +129,88 @@ impl Rkvr {
     // the metadata file will have the fully qualified path of the item, then a colon:
     // then the output of the ls or tree command on a new line, indented by two spaces
     // note: if output as multiple lines with newlines, every line should be indented by the two spaces
-    fn archive(&self, items: &[String], path: &str, sudo: bool) -> Result<()> {
-        let timestamp_path = format!("{}/{}", path, self.timestamp);
-        let timestamp_path = Path::new(&timestamp_path);
+    fn archive(&self, items: &[String], path: &str, sudo: bool) -> Result<Vec<PathBuf>> {
+        let timestamp_path = Path::new(path).join(&self.timestamp.to_string());
         fs::create_dir_all(&timestamp_path).map_err(|e| eyre!(e))?;
-    
+
         // Collect all matching items in the current working directory.
-        let cwd_items: Vec<_> = items.iter().filter_map(|item| {
+        let cwd_items: Vec<_> = items.iter().map(|item| {
             let item_path = self.cwd.join(item);
             if item_path.exists() {
-                Some(item_path)
+                (item.clone(), Some(item_path))
             } else {
-                None
+                (item.clone(), None)
             }
         }).collect();
-    
-        if cwd_items.is_empty() {
-            return Ok(());
+
+        if cwd_items.iter().all(|(_, path)| path.is_none()) {
+            return Ok(vec![]);
         }
-    
+
         // Archive the items.
         let archive_path = timestamp_path.join("archive.tar.gz");
-        let tar_gz = fs::File::create(&archive_path)?;
-        let enc = flate2::write::GzEncoder::new(tar_gz, flate2::Compression::default());
-        let mut tar = tar::Builder::new(enc);
-        for item in &cwd_items {
-            // Get the relative path from current directory
-            let relative_path = item.strip_prefix(&self.cwd)?;
-            tar.append_path(relative_path)?;
+        let mut tar = Self::create_tar(&archive_path)?;
+        let metadata_path = timestamp_path.join("archive.metadata");
+        let mut metadata_file = fs::File::create(metadata_path)?;
+
+        let mut paths_to_remove = vec![];
+        for (item, item_path) in &cwd_items {
+            if let Some(path) = item_path {
+
+                let output: Output = Self::get_output(&path, sudo)?;
+                let output_str = String::from_utf8_lossy(&output.stdout).to_string();
+
+                let metadata = Metadata {
+                    item: item.clone(),
+                    output: output_str,
+                };
+
+                let yaml = serde_yaml::to_string(&metadata)?;
+                write!(metadata_file, "{}\n---\n", yaml)?;
+
+                // Get the relative path from current directory
+                let relative_path = path.strip_prefix(&self.cwd)?;
+                tar.append_path(relative_path)?;
+
+                paths_to_remove.push(path.clone());
+            }
         }
         tar.into_inner()?.finish()?;
-    
-        // Create metadata files.
-        for item in &cwd_items {
-            let metadata_path = timestamp_path.join(format!("{}.metadata", make_name(&item)?));
-            let mut metadata_file = fs::File::create(metadata_path)?;
-    
-            let output = if item.is_dir() {
-                execute(sudo, &["tree", "-l", item.to_str().unwrap()])
+        metadata_file.flush()?;
+
+        Ok(paths_to_remove)
+    }
+
+    fn remove(&self, items: Vec<PathBuf>) -> Result<()> {
+        for item in items {
+            if item.is_dir() {
+                fs::remove_dir_all(item)?;
             } else {
-                execute(sudo, &["ls", "-l", item.to_str().unwrap()])
-            };
-    
-            if !output.stderr.is_empty() {
-                return Err(eyre!(String::from_utf8_lossy(&output.stderr).to_string()));
+                fs::remove_file(item)?;
             }
-    
-            // Split the output into lines, indent each line by 2 spaces, and then join them back together
-            let indented_output = output.stdout
-                .split('\n')
-                .map(|line| format!("  {}", line))
-                .collect::<Vec<_>>()
-                .join("\n");
-    
-            write!(metadata_file, "{}:\n{}\n", item.to_string_lossy(), indented_output)?;
         }
-    
         Ok(())
     }
-    
-    // fn archive(&self, items: &[String], path: &str, sudo: bool) -> Result<()> {
-    //     let timestamp_path = format!("{}/{}", path, self.timestamp);
-    //     let timestamp_path = Path::new(&timestamp_path);
-    //     fs::create_dir_all(&timestamp_path).map_err(|e| eyre!(e))?;
-    
-    //     // Collect all matching items in the current working directory.
-    //     let cwd_items: Vec<_> = items.iter().filter_map(|item| {
-    //         let item_path = self.cwd.join(item);
-    //         if item_path.exists() {
-    //             Some(item_path)
-    //         } else {
-    //             None
-    //         }
-    //     }).collect();
-    
-    //     if cwd_items.is_empty() {
-    //         return Ok(());
-    //     }
 
-    //     // Archive the items.
-    //     let archive_path = timestamp_path.join("archive.tar.gz");
-    //     let tar_gz = fs::File::create(&archive_path)?;
-    //     let enc = flate2::write::GzEncoder::new(tar_gz, flate2::Compression::default());
-    //     let mut tar = tar::Builder::new(enc);
-    //     for item in &cwd_items {
-    //         // Get the relative path from current directory
-    //         let relative_path = item.strip_prefix(&self.cwd)?;
-    //         tar.append_path(relative_path)?;
-    //     }
-    //     tar.into_inner()?.finish()?;
-    
-    //     // Create metadata files.
-    //     for item in cwd_items {
-    //         let metadata_path = timestamp_path.join(format!("{}.metadata", make_name(&item)?));
-    //         let mut metadata_file = fs::File::create(metadata_path)?;
-    
-    //         let output = if item.is_dir() {
-    //             execute(sudo, &["tree", "-l", item.to_str().unwrap()])
-    //         } else {
-    //             execute(sudo, &["ls", "-l", item.to_str().unwrap()])
-    //         };
-    
-    //         if !output.stderr.is_empty() {
-    //             return Err(eyre!(String::from_utf8_lossy(&output.stderr).to_string()));
-    //         }
-    
-    //         write!(metadata_file, "{}:\n  {}\n", item.to_string_lossy(), String::from_utf8_lossy(&output.stdout))?;
-    //     }
-    
-    //     Ok(())
-    // }
+    fn create_tar(archive_path: &PathBuf) -> Result<tar::Builder<flate2::write::GzEncoder<fs::File>>> {
+        let tar_gz = fs::File::create(&archive_path)?;
+        let enc = flate2::write::GzEncoder::new(tar_gz, flate2::Compression::default());
+        let tar = tar::Builder::new(enc);
+        Ok(tar)
+    }
+
+    fn get_output(item: &PathBuf, sudo: bool) -> Result<Output> {
+        let output = if item.is_dir() {
+            execute(sudo, &["tree", "-l", item.to_str().unwrap()])
+        } else {
+            execute(sudo, &["ls", "-l", item.to_str().unwrap()])
+        };
+
+        if !output.stderr.is_empty() {
+            return Err(eyre!(String::from_utf8_lossy(&output.stderr).to_string()));
+        }
+        Ok(output)
+    }
 
     // patterns: list of globa patterns (item*) to match against the metadata files
     // path: fully qualified path to archive where the timestamp directories are located
@@ -257,25 +219,10 @@ impl Rkvr {
     // matches are inclusive, so if item one matches some pattern and item two matches some other pattern, both are returned
     // returned just means that the contents of the metadata file are printed to stdout
     // note the glob patterns are left anchored, so item* will match item1, item2, item3, etc.
-    fn list(&self, patterns: &[String], path: &str) -> Result<()> {
+    fn list(&self, _patterns: &[String], path: &str) -> Result<()> {
         let archive_path = Path::new(path);
         if !archive_path.exists() {
             return Err(eyre!("Archive path does not exist"));
-        }
-
-        // Create a vector to hold all the glob::Pattern structs.
-        let mut glob_patterns = Vec::new();
-        for pattern in patterns {
-            let pattern_str = if pattern.starts_with("/") {
-                pattern.clone()
-            } else {
-                self.cwd.join(pattern).to_string_lossy().to_string()
-            };
-
-            // convert the pattern into a canonicalized pattern (fully qualified path)
-            let pattern_str = fs::canonicalize(pattern_str)?.to_string_lossy().into_owned();
-            let glob_pattern = glob::Pattern::new(&pattern_str)?;
-            glob_patterns.push(glob_pattern);
         }
 
         let metadata_entries = fs::read_dir(archive_path)?;
@@ -283,19 +230,21 @@ impl Rkvr {
             if let Ok(entry) = entry {
                 let entry_path = entry.path();
                 if entry_path.is_dir() {
-                    let timestamp_entries = fs::read_dir(entry_path)?;
+                    let timestamp_entries = fs::read_dir(entry_path.clone())?;
                     for timestamp_entry in timestamp_entries {
                         if let Ok(timestamp_entry) = timestamp_entry {
                             let timestamp_path = timestamp_entry.path();
                             if timestamp_path.is_file() && timestamp_path.extension().unwrap() == "metadata" {
                                 // convert the path into a canonicalized path (fully qualified path)
                                 let timestamp_path_str = fs::canonicalize(timestamp_path)?.to_string_lossy().into_owned();
-                                for pattern in &glob_patterns {
-                                    if pattern.matches_path(Path::new(&timestamp_path_str)) {
-                                        let contents = fs::read_to_string(Path::new(&timestamp_path_str))?;
-                                        println!("{}", contents);
-                                    }
-                                }
+                                let contents = fs::read_to_string(Path::new(&timestamp_path_str))?;
+                                let timestamp = entry_path.file_name().unwrap().to_str().unwrap();
+                                let indented_contents = contents
+                                    .lines()
+                                    .map(|line| format!("  {}", line))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                println!("{}:\n{}", timestamp, indented_contents);
                             }
                         }
                     }
@@ -368,10 +317,14 @@ impl Rkvr {
         let action = cli.action.ok_or_else(|| eyre!("no action specified"))?;
         match action {
             Action::Rmrf(ref rmrf) => {
-                self.archive(&rmrf.items, &self.rmrf_path, self.rmrf_sudo)?;
+                let paths_to_remove = self.archive(&rmrf.items, &self.rmrf_path, self.rmrf_sudo)?;
+                // Remove the original files/directories after successful archiving.
+                self.remove(paths_to_remove)?;
                 self.harvest(&self.rmrf_path, self.rmrf_keep)?;
             },
-            Action::Bkup(ref bkup) => self.archive(&bkup.items, &self.bkup_path, self.bkup_sudo)?,
+            Action::Bkup(ref bkup) => {
+                self.archive(&bkup.items, &self.bkup_path, self.bkup_sudo)?;
+            }
             Action::Ls(ref list) => {
                 let mode = list.modes.as_ref().ok_or_else(|| eyre!("no mode specified"))?;
                 match mode {
