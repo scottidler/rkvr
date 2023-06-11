@@ -11,7 +11,7 @@ use serde::{Serialize, Deserialize};
 
 use std::collections::HashMap;
 
-fn execute<T: AsRef<str>>(sudo: bool, args: &[T]) -> Output {
+fn execute<T: AsRef<str>>(sudo: bool, args: &[T]) -> Result<Output, std::io::Error> {
     let mut args: Vec<String> = args.iter().map(|arg| arg.as_ref().to_owned()).collect();
     if sudo {
         args.insert(0, "sudo".to_owned());
@@ -20,7 +20,7 @@ fn execute<T: AsRef<str>>(sudo: bool, args: &[T]) -> Output {
     for arg in &args[1..] {
         command.arg(arg);
     }
-    command.output().expect("failed to execute process")
+    command.output()
 }
 
 #[derive(Parser, Debug, Default, Clone)]
@@ -198,16 +198,23 @@ impl Rkvr {
     }
 
     fn get_output(item: &Path, sudo: bool) -> Result<Output> {
+        let item_str = item
+            .to_str()
+            .ok_or_else(|| eyre::eyre!("Failed to convert path to string"))?;
+
         let output = if item.is_dir() {
-            execute(sudo, &["tree", "-l", item.to_str().unwrap()])
+            execute(sudo, &["tree", "-l", item_str])
         } else {
-            execute(sudo, &["ls", "-l", item.to_str().unwrap()])
+            execute(sudo, &["ls", "-l", item_str])
         };
 
-        if !output.stderr.is_empty() {
-            return Err(eyre!(String::from_utf8_lossy(&output.stderr).to_string()));
+        if output.is_err() || !output.as_ref().unwrap().stderr.is_empty() {
+            return Err(eyre::eyre!(
+                "Command failed with error: {}",
+                String::from_utf8_lossy(&output.as_ref().unwrap().stderr)
+            ));
         }
-        Ok(output)
+        Ok(output.unwrap())
     }
 
     // patterns: list of globa patterns (item*) to match against the metadata files
