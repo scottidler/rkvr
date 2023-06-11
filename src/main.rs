@@ -6,11 +6,11 @@ use expanduser::expanduser;
 use std::time::SystemTime;
 use std::process::{Command, Output};
 use std::path::{Path, PathBuf};
-use std::io::Write;
 use std::env;
 use std::fs;
 use serde::Serialize;
 use serde_yaml;
+use std::collections::HashMap;
 
 fn execute<T: AsRef<str>>(sudo: bool, args: &[T]) -> Output {
     let mut args: Vec<String> = args.iter().map(|arg| arg.as_ref().to_owned()).collect();
@@ -71,11 +71,9 @@ struct Rkvr {
     cwd: PathBuf,
 }
 
-
 #[derive(Serialize)]
 struct Metadata {
-    item: String,
-    output: String,
+    items: HashMap<String, String>,
 }
 
 
@@ -151,22 +149,19 @@ impl Rkvr {
         let archive_path = timestamp_path.join("archive.tar.gz");
         let mut tar = Self::create_tar(&archive_path)?;
         let metadata_path = timestamp_path.join("archive.metadata");
-        let mut metadata_file = fs::File::create(metadata_path)?;
 
         let mut paths_to_remove = vec![];
+        let mut metadata = Metadata {
+            items: HashMap::new(),
+        };
+
         for (item, item_path) in &cwd_items {
             if let Some(path) = item_path {
 
                 let output: Output = Self::get_output(&path, sudo)?;
-                let output_str = String::from_utf8_lossy(&output.stdout).to_string();
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
-                let metadata = Metadata {
-                    item: item.clone(),
-                    output: output_str,
-                };
-
-                let yaml = serde_yaml::to_string(&metadata)?;
-                write!(metadata_file, "{}\n---\n", yaml)?;
+                metadata.items.insert(item.clone(), stdout);
 
                 // Get the relative path from current directory
                 let relative_path = path.strip_prefix(&self.cwd)?;
@@ -175,8 +170,11 @@ impl Rkvr {
                 paths_to_remove.push(path.clone());
             }
         }
+
+        let yaml = serde_yaml::to_string(&metadata)?;
+        fs::write(metadata_path, yaml)?;
+
         tar.into_inner()?.finish()?;
-        metadata_file.flush()?;
 
         Ok(paths_to_remove)
     }
