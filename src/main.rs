@@ -1,7 +1,6 @@
 
 use eyre::{eyre, Result};
 use clap::{Parser, Subcommand};
-use configparser::ini::Ini;
 use expanduser::expanduser;
 use std::time::SystemTime;
 use std::process::{Command, Output};
@@ -71,6 +70,25 @@ struct Rkvr {
     cwd: PathBuf,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct RmrfConfig {
+    path: String,
+    sudo: bool,
+    keep: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BkupConfig {
+    path: String,
+    sudo: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RkvrConfig {
+    rmrf: RmrfConfig,
+    bkup: BkupConfig,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Metadata {
     items: HashMap<String, String>,
@@ -78,43 +96,23 @@ struct Metadata {
 
 
 impl Rkvr {
-    pub fn new(rkvr_cfg: &str) -> Result<Self> {
-        /*
-        ❯ bat -p ~/.config/rkvr/rkvr.cfg
-        [rmrf]
-        path=/var/tmp/rkvr/rmrf/
 
-        sudo=true
-
-        keep=21
-
-        [bkup]
-        path=/var/tmp/rkvr/bkup/
-
-        sudo=true
-        */
-        // use the above config file to set the defaults
-        // expanduser() is needed because configparser::ini::Ini::load() does not expand ~
-        let rkvr_path = expanduser(rkvr_cfg)?;
-        let mut rkvr_cfg = Ini::new();
-        rkvr_cfg.load(&rkvr_path).map_err(|e| eyre!(e))?;
-
-        let rmrf_path = rkvr_cfg.get("rmrf", "path").ok_or_else(|| eyre!("rmrf path not found"))?;
-        let rmrf_sudo = rkvr_cfg.get("rmrf", "sudo").map(|val| val == "true").ok_or_else(|| eyre!("rmrf sudo not found"))?;
-        let rmrf_keep = rkvr_cfg.get("rmrf", "keep").and_then(|val| val.parse().ok()).ok_or_else(|| eyre!("rmrf keep not found"))?;
-        let bkup_path = rkvr_cfg.get("bkup", "path").ok_or_else(|| eyre!("bkup path not found"))?;
-        let bkup_sudo = rkvr_cfg.get("bkup", "sudo").map(|val| val == "true").ok_or_else(|| eyre!("bkup sudo not found"))?;
+    pub fn new(rkvr_yml: &str) -> Result<Self> {
+        let rkvr_path = expanduser(rkvr_yml)?;
+        let rkvr_cfg_str = fs::read_to_string(rkvr_path)?;
+        let rkvr_cfg: RkvrConfig = serde_yaml::from_str(&rkvr_cfg_str)?;
 
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)?
             .as_secs();
         let cwd = env::current_dir()?;
+
         Ok(Self {
-            rmrf_path,
-            rmrf_keep,
-            rmrf_sudo,
-            bkup_path,
-            bkup_sudo,
+            rmrf_path: rkvr_cfg.rmrf.path,
+            rmrf_keep: rkvr_cfg.rmrf.keep,
+            rmrf_sudo: rkvr_cfg.rmrf.sudo,
+            bkup_path: rkvr_cfg.bkup.path,
+            bkup_sudo: rkvr_cfg.bkup.sudo,
             timestamp,
             cwd,
         })
@@ -357,9 +355,9 @@ impl Rkvr {
 }
 
 fn main() -> Result<()> {
-    let rkvr_cfg = env::var("RKVR_CFG")
-        .unwrap_or("~/.config/rkvr/rkvr.cfg".to_owned());
-    let rkvr = Rkvr::new(&rkvr_cfg)?;
+    let rkvr_yml = env::var("RKVR_CFG")
+        .unwrap_or("~/.config/rkvr/rkvr.yml".to_owned());
+    let rkvr = Rkvr::new(&rkvr_yml)?;
     rkvr.run()?;
     Ok(())
 }
