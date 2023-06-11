@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::env;
 use std::fs;
 use serde::{Serialize, Deserialize};
-use serde_yaml;
+
 use std::collections::HashMap;
 
 fn execute<T: AsRef<str>>(sudo: bool, args: &[T]) -> Output {
@@ -158,7 +158,7 @@ impl Rkvr {
         for (item, item_path) in &cwd_items {
             if let Some(path) = item_path {
 
-                let output: Output = Self::get_output(&path, sudo)?;
+                let output: Output = Self::get_output(path, sudo)?;
                 let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
                 metadata.items.insert(item.clone(), stdout);
@@ -179,7 +179,7 @@ impl Rkvr {
         Ok(paths_to_remove)
     }
 
-    fn remove(&self, items: Vec<PathBuf>) -> Result<()> {
+    fn remove(items: Vec<PathBuf>) -> Result<()> {
         for item in items {
             if item.is_dir() {
                 fs::remove_dir_all(item)?;
@@ -191,13 +191,13 @@ impl Rkvr {
     }
 
     fn create_tar(archive_path: &PathBuf) -> Result<tar::Builder<flate2::write::GzEncoder<fs::File>>> {
-        let tar_gz = fs::File::create(&archive_path)?;
+        let tar_gz = fs::File::create(archive_path)?;
         let enc = flate2::write::GzEncoder::new(tar_gz, flate2::Compression::default());
         let tar = tar::Builder::new(enc);
         Ok(tar)
     }
 
-    fn get_output(item: &PathBuf, sudo: bool) -> Result<Output> {
+    fn get_output(item: &Path, sudo: bool) -> Result<Output> {
         let output = if item.is_dir() {
             execute(sudo, &["tree", "-l", item.to_str().unwrap()])
         } else {
@@ -217,7 +217,7 @@ impl Rkvr {
     // matches are inclusive, so if item one matches some pattern and item two matches some other pattern, both are returned
     // returned just means that the contents of the metadata file are printed to stdout
     // note the glob patterns are left anchored, so item* will match item1, item2, item3, etc.
-    fn list(&self, patterns: &[String], path: &str) -> Result<()> {
+    fn list(patterns: &[String], path: &str) -> Result<()> {
         let archive_path = Path::new(path);
         if !archive_path.exists() {
             return Err(eyre!("Archive path does not exist"));
@@ -255,10 +255,10 @@ impl Rkvr {
                                     Some(timestamp) => {
                                         let indented_contents = contents
                                             .lines()
-                                            .map(|line| format!("  {}", line))
+                                            .map(|line| format!("  {line}"))
                                             .collect::<Vec<_>>()
                                             .join("\n");
-                                        println!("{}:\n{}", timestamp, indented_contents);
+                                        println!("{timestamp}:\n{indented_contents}");
                                     },
                                     None => return Err(eyre!("Failed to convert file name to string")),
                                 },
@@ -289,10 +289,7 @@ impl Rkvr {
 
         for entry_result in read_dir {
             // Unwrap the entry. If this fails, skip to the next entry.
-            let entry = match entry_result {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
+            let Ok(entry) = entry_result else { continue };
 
             // Check that the entry is a directory.
             let metadata = entry.metadata()?;
@@ -316,7 +313,7 @@ impl Rkvr {
                 // If the metadata file exists, print it to stdout.
                 if metadata_file_path.exists() {
                     let metadata = fs::read_to_string(&metadata_file_path)?;
-                    println!("{}", metadata);
+                    println!("{metadata}");
                 }
 
                 // Delete the directory.
@@ -336,7 +333,7 @@ impl Rkvr {
             Action::Rmrf(ref rmrf) => {
                 let paths_to_remove = self.archive(&rmrf.items, &self.rmrf_path, self.rmrf_sudo)?;
                 // Remove the original files/directories after successful archiving.
-                self.remove(paths_to_remove)?;
+                Self::remove(paths_to_remove)?;
                 self.harvest(&self.rmrf_path, self.rmrf_keep)?;
             },
             Action::Bkup(ref bkup) => {
@@ -345,8 +342,8 @@ impl Rkvr {
             Action::Ls(ref list) => {
                 let mode = list.modes.as_ref().ok_or_else(|| eyre!("no mode specified"))?;
                 match mode {
-                    Mode::Rmrf(rmrf) => self.list(&rmrf.items, &self.rmrf_path)?,
-                    Mode::Bkup(bkup) => self.list(&bkup.items, &self.bkup_path)?,
+                    Mode::Rmrf(rmrf) => Self::list(&rmrf.items, &self.rmrf_path)?,
+                    Mode::Bkup(bkup) => Self::list(&bkup.items, &self.bkup_path)?,
                 }
             }
         }
