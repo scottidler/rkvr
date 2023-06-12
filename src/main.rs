@@ -208,13 +208,16 @@ impl Rkvr {
             execute(sudo, &["ls", "-l", item_str])
         };
 
-        if output.is_err() || !output.as_ref().unwrap().stderr.is_empty() {
-            return Err(eyre::eyre!(
+        let output = output.map_err(|_| eyre::eyre!("Command failed to execute"))?;
+
+        if output.stderr.is_empty() {
+            Ok(output)
+        } else {
+            Err(eyre::eyre!(
                 "Command failed with error: {}",
-                String::from_utf8_lossy(&output.as_ref().unwrap().stderr)
-            ));
+                String::from_utf8_lossy(&output.stderr)
+            ))
         }
-        Ok(output.unwrap())
     }
 
     // patterns: list of globa patterns (item*) to match against the metadata files
