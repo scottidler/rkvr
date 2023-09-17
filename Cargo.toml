@@ -11,5 +11,7 @@ clap = { version = "4.3.0", features = ["derive"] }
 configparser = "3.0.2"
 dirs = "3.0.2"
 eyre = "0.6.8"
+flate2 = "1.0.27"
 libc ="0.2.144"
+tar = "0.4.40"
 walkdir = "2.4.0"

@@ -14,13 +14,15 @@ use clap::{Parser, Subcommand};
 use configparser::ini::Ini;
 use dirs;
 use eyre::{eyre, Context, Result};
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use tar::Builder;
 use walkdir::WalkDir;
 
 #[derive(Parser)]
 #[command(name = "rmrf", about = "tool for staging rmrf-ing or bkup-ing files")]
 #[command(version = "0.1.0")]
 #[command(author = "Scott A. Idler <scott.a.idler@gmail.com>")]
-#[command(after_help = "after_help")]
 #[command(arg_required_else_help = true)]
 struct Cli {
     #[arg(name = "targets")]
@@ -32,12 +34,16 @@ struct Cli {
 
 #[derive(Subcommand, Debug, Default)]
 enum Action {
+    #[command(about = "bkup files")]
     Bkup,
     #[default]
-    #[command(about = "[default] rmrf files")]
+    #[command(about = "rmrf files [default]")]
     Rmrf,
+    #[command(about = "list bkup files")]
     LsBkup,
+    #[command(about = "list rmrf files")]
     LsRmrf,
+    #[command(about = "bkup files and rmrf the local files")]
     BkupRmrf,
 }
 // make a name from the basename of the path
@@ -103,9 +109,12 @@ fn main() -> Result<()> {
         match action {
             Action::Bkup => archive(&bkup_path, timestamp.to_string(), &target, sudo, false, None)?,
             Action::Rmrf => archive(&rmrf_path, timestamp.to_string(), &target, sudo, true, Some(days))?,
-            Action::LsBkup => println!("ls bkup"),
-            Action::LsRmrf => println!("ls rmrf"),
-            Action::BkupRmrf => println!("bkup rmrf"),
+            Action::LsBkup => list(&bkup_path, true)?,
+            Action::LsRmrf => list(&rmrf_path, true)?,
+            Action::BkupRmrf => {
+                archive(&bkup_path, timestamp.to_string(), &target, sudo, false, None)?;
+                archive(&rmrf_path, timestamp.to_string(), &target, sudo, true, Some(days))?;
+            }
         }
     }
 
@@ -255,9 +264,61 @@ fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bo
         execute(sudo, &vec!["rm", "-rf", rmrf_path])?;
     }
 
+    // Create a path for the new tarball
+    let tarball_path = base.join(format!("{}.tar.gz", name));
+
+    // Create and open a new file for the tarball
+    let tar_gz = File::create(&tarball_path)?;
+
+    // Create a GzEncoder with the default compression level
+    let enc = GzEncoder::new(tar_gz, Compression::default());
+
+    // Create a new tar builder
+    let mut tar = Builder::new(enc);
+
+    // Append a file or a directory to the tarball
+    tar.append_dir_all(name, target)?;
+
+    // Finalize the tarball
+    tar.into_inner()?;
+
     Ok(())
 }
 
+fn list_tarball_contents(tarball_path: &Path) -> Result<()> {
+    let tar_gz = File::open(tarball_path)?;
+    let tar = flate2::read::GzDecoder::new(tar_gz);
+    let mut archive = tar::Archive::new(tar);
+
+    for file in archive.entries()? {
+        let mut file = file?;
+        println!("  {}", file.path()?.display());
+    }
+
+    Ok(())
+}
+
+fn list(dir_path: &Path, list_contents: bool) -> Result<()> {
+    let tarballs = find_files_with_extension(dir_path, "tar.gz");
+    for tarball in tarballs {
+        let metadata = fs::metadata(&tarball)?;
+        let size = metadata.len();
+        println!("{:?} {}K", tarball, size / 1024);
+
+        if list_contents {
+            println!("Contents:");
+            list_tarball_contents(&Path::new(&tarball))?;
+        }
+    }
+
+    let metadata = fs::metadata(dir_path)?;
+    let size = metadata.len();
+    println!("{:?} {}K", dir_path, size / 1024);
+
+    Ok(())
+}
+
+/*
 fn list(dir_path: &Path) {
     let tarballs = find_files_with_extension(dir_path, "tar.gz");
     for tarball in tarballs {
@@ -279,6 +340,7 @@ fn list(dir_path: &Path) {
     let size = metadata.len();
     println!("{:?} {}K", dir_path, size / 1024);
 }
+*/
 
 fn find_files_with_extension(dir_path: &Path, ext: &str) -> Vec<String> {
     let mut result = vec![];
