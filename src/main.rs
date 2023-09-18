@@ -169,7 +169,7 @@ fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bo
     if target == &base {
         println!("{} ->", path.to_string_lossy());
         let output = execute(
-            sudo,
+            false,
             &vec![
                 "tar",
                 "--absolute-names",
@@ -207,7 +207,7 @@ fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bo
     metadata_file.write_all(&output.stdout)?;
 
     let output = execute(
-        sudo,
+        false,
         &vec![
             "tar",
             "--absolute-names",
@@ -228,7 +228,7 @@ fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bo
 
     if let Some(days) = keep {
         let output = execute(
-            sudo,
+            false,
             &vec![
                 "find",
                 base.to_string_lossy().as_ref(),
@@ -245,7 +245,7 @@ fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bo
             println!("-> /dev/null");
         }
         execute(
-            sudo,
+            false,
             &vec![
                 "find",
                 base.to_string_lossy().as_ref(),
@@ -258,10 +258,11 @@ fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bo
         )?;
     }
 
-    let rmrf_path = target.to_str().ok_or(eyre!("Error running rm -rf"))?;
-    if remove {
-        println!("rm -rf {}", target.to_string_lossy());
-        execute(sudo, &vec!["rm", "-rf", rmrf_path])?;
+    // Debugging: Print target path before any delete operation
+    println!("Target path: {:?}", target);
+    if !target.exists() {
+        println!("Target does not exist.");
+        return Err(eyre!("Target does not exist"));
     }
 
     // Create a path for the new tarball
@@ -276,11 +277,24 @@ fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bo
     // Create a new tar builder
     let mut tar = Builder::new(enc);
 
-    // Append a file or a directory to the tarball
-    tar.append_dir_all(name, target)?;
+    // Check if the target is a directory or a file
+    let metadata = fs::metadata(target)?;
+    if metadata.is_dir() {
+        // Append a directory to the tarball
+        tar.append_dir_all(name, target)?;
+    } else {
+        // Append a file to the tarball
+        tar.append_path_with_name(target, name)?;
+    }
 
     // Finalize the tarball
     tar.into_inner()?;
+
+    let rmrf_path = target.to_str().ok_or(eyre!("Error running rm -rf"))?;
+    if remove {
+        println!("rm -rf {}", target.to_string_lossy());
+        execute(sudo, &vec!["rm", "-rf", rmrf_path])?;
+    }
 
     Ok(())
 }
@@ -317,30 +331,6 @@ fn list(dir_path: &Path, list_contents: bool) -> Result<()> {
 
     Ok(())
 }
-
-/*
-fn list(dir_path: &Path) {
-    let tarballs = find_files_with_extension(dir_path, "tar.gz");
-    for tarball in tarballs {
-        let metadata = fs::metadata(&tarball).unwrap();
-        let size = metadata.len();
-        println!("{:?} {}K", tarball, size / 1024);
-
-        let output = Command::new("sudo")
-            .arg("tar")
-            .arg("--absolute-names")
-            .arg("-tvf")
-            .arg(&tarball)
-            .output()
-            .unwrap();
-        print!("  {}", String::from_utf8_lossy(&output.stdout));
-    }
-
-    let metadata = fs::metadata(dir_path).unwrap();
-    let size = metadata.len();
-    println!("{:?} {}K", dir_path, size / 1024);
-}
-*/
 
 fn find_files_with_extension(dir_path: &Path, ext: &str) -> Vec<String> {
     let mut result = vec![];
