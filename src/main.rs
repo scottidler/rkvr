@@ -207,7 +207,7 @@ fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bo
     metadata_file.write_all(&output.stdout)?;
 
     let output = execute(
-        false,
+        sudo,
         &vec![
             "tar",
             "--absolute-names",
@@ -225,6 +225,21 @@ fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bo
     let new_tarball_path = base.join(&tarball);
     fs::rename(&tarball, &new_tarball_path)?;
     println!("-> {}", new_tarball_path.to_string_lossy());
+
+    // If sudo is true, change ownership of the tarball to the user running the script
+    if sudo {
+        let current_user = whoami::username();
+        execute(
+            true,
+            &vec![
+                "chown",
+                &current_user,
+                new_tarball_path
+                    .to_str()
+                    .ok_or(eyre!("Failed to convert path to string"))?,
+            ],
+        )?;
+    }
 
     if let Some(days) = keep {
         let output = execute(
