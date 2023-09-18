@@ -1,6 +1,7 @@
 #![cfg_attr(debug_assertions, allow(unused_imports, unused_variables, unused_mut, dead_code))]
 
 // Standard library imports
+use log::{debug, error, info, warn};
 use std::fs::{self, File, OpenOptions};
 use std::io::prelude::*;
 use std::os::unix::fs::PermissionsExt;
@@ -19,7 +20,7 @@ use flate2::Compression;
 use tar::Builder;
 use walkdir::WalkDir;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "rmrf", about = "tool for staging rmrf-ing or bkup-ing files")]
 #[command(version = "0.1.0")]
 #[command(author = "Scott A. Idler <scott.a.idler@gmail.com>")]
@@ -46,8 +47,10 @@ enum Action {
     #[command(about = "bkup files and rmrf the local files")]
     BkupRmrf,
 }
-// make a name from the basename of the path
 fn make_name(path: &Path) -> Result<String> {
+    debug!("Entering make_name function");
+    info!("Processing path: {}", path.to_string_lossy());
+
     let name = path
         .file_name()
         .ok_or_else(|| eyre!("Failed to get file name"))?
@@ -58,10 +61,13 @@ fn make_name(path: &Path) -> Result<String> {
         .replace(":", "_")
         .replace(" ", "_");
 
+    debug!("Generated name: {}", name);
     Ok(name)
 }
 
-fn execute<T: AsRef<str>>(sudo: bool, args: &[T]) -> Result<Output> {
+fn execute<T: AsRef<str> + std::fmt::Debug>(sudo: bool, args: &[T]) -> Result<Output> {
+    info!("execute: sudo={}, args={:?}", sudo, args);
+
     let mut command = Command::new(if sudo { "sudo" } else { args[0].as_ref() });
 
     if sudo {
@@ -72,13 +78,30 @@ fn execute<T: AsRef<str>>(sudo: bool, args: &[T]) -> Result<Output> {
         command.arg(arg.as_ref());
     }
 
-    command.output().map_err(|e| eyre!(e))
+    let output = command.output().map_err(|e| eyre!(e));
+
+    match &output {
+        Ok(o) => debug!("Command executed successfully with output: {:?}", o),
+        Err(e) => error!("Command execution failed with error: {:?}", e),
+    }
+
+    output
 }
 
 fn main() -> Result<()> {
-    let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    env_logger::init();
+    let args = std::env::args().collect::<Vec<String>>();
+    info!("main: args={:?}", args);
 
-    let matches = Cli::parse();
+    let current_level = log::max_level();
+    debug!("Current log level: {:?}", current_level);
+
+    let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    debug!("Current timestamp: {}", timestamp);
+
+    let matches = Cli::parse_from(args);
+    debug!("CLI arguments parsed: {:?}", matches);
+
     let action: Action = matches.action.unwrap_or_default();
     let targets: Vec<PathBuf> = matches
         .targets
@@ -86,26 +109,38 @@ fn main() -> Result<()> {
         .map(|f| fs::canonicalize(f).unwrap().to_string_lossy().into_owned())
         .map(|f| PathBuf::from(f))
         .collect();
+    info!("Action: {:?}, Targets: {:?}", action, targets);
 
     let rmrf_cfg_path = dirs::home_dir()
         .ok_or(eyre!("home dir not found!"))?
         .join(".config/rmrf/rmrf2.cfg");
+    debug!("Configuration file path: {:?}", rmrf_cfg_path);
+
     let mut rmrf_cfg = Ini::new();
     rmrf_cfg
         .load(&rmrf_cfg_path)
         .map_err(|e| eyre!(e))
         .wrap_err("Failed to load config")?;
+    debug!("Configuration loaded: {:?}", rmrf_cfg);
+
     let path = rmrf_cfg.get("DEFAULT", "path").unwrap_or("/var/tmp/rmrf".to_owned());
     let sudo: bool = rmrf_cfg.get("DEFAULT", "sudo").unwrap_or("yes".to_owned()) == "yes";
     let days: i32 = rmrf_cfg.get("DEFAULT", "keep").unwrap_or("21".to_owned()).parse()?;
+    info!(
+        "Configuration - path: {}, sudo: {}, keep for days: {}",
+        path, sudo, days
+    );
 
     let rmrf_path = Path::new(&path);
     let bkup_path = Path::new(&rmrf_path).join("bkup");
+    debug!("rmrf_path: {:?}, bkup_path: {:?}", rmrf_path, bkup_path);
 
     fs::create_dir_all(&rmrf_path)?;
     fs::create_dir_all(&bkup_path)?;
+    info!("Directories created or verified: {:?}, {:?}", rmrf_path, bkup_path);
 
     for target in targets.into_iter() {
+        info!("Processing target: {:?}", target);
         match action {
             Action::Bkup => archive(&bkup_path, timestamp.to_string(), &target, sudo, false, None)?,
             Action::Rmrf => archive(&rmrf_path, timestamp.to_string(), &target, sudo, true, Some(days))?,
@@ -122,24 +157,31 @@ fn main() -> Result<()> {
 }
 
 fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
-    let now = SystemTime::now();
+    info!("fn cleanup: dir_path={} days={}", dir_path.to_string_lossy(), days);
 
-    // Read the directory
+    let now = SystemTime::now();
+    debug!("Current time: {:?}", now);
+
     let entries = fs::read_dir(dir_path)?;
+    debug!("Directory entries read");
 
     for entry in entries {
         if let Ok(entry) = entry {
             let path = entry.path();
+            debug!("Checking path: {}", path.to_string_lossy());
+
             let metadata = fs::metadata(&path)?;
+            debug!("Metadata retrieved");
 
-            // Get the modified time as a SystemTime
             let modified_time = metadata.modified()?;
+            debug!("Modified time: {:?}", modified_time);
 
-            // Calculate the duration since the file was last modified
             if let Ok(duration_since_modified) = now.duration_since(modified_time) {
-                // Convert days to duration and compare
+                debug!("Duration since modified: {:?}", duration_since_modified);
+
                 if duration_since_modified > std::time::Duration::from_secs(60 * 60 * 24 * days as u64) {
-                    // Delete the file or directory
+                    info!("Deleting path: {}", path.to_string_lossy());
+
                     if metadata.is_dir() {
                         fs::remove_dir_all(&path)?;
                     } else {
@@ -150,61 +192,43 @@ fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
         }
     }
 
+    info!("Cleanup completed");
     Ok(())
 }
 
 fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
-    println!(
-        "archive: path={} timestamp={} target={}",
+    info!(
+        "fn archive: path={} timestamp={} target={} sudo={} remove={} keep={:?}",
         path.to_string_lossy(),
         timestamp,
-        target.to_string_lossy()
+        target.to_string_lossy(),
+        sudo,
+        remove,
+        keep,
     );
-    let name = make_name(target)?;
-    println!("name={}", name);
-    let base = path.join(&timestamp);
-    println!("base={}", base.to_string_lossy());
-    execute(false, &vec!["mkdir", "-p", base.to_str().unwrap()])?;
 
-    if target == &base {
-        println!("{} ->", path.to_string_lossy());
-        let output = execute(
-            false,
-            &vec![
-                "tar",
-                "--absolute-names",
-                "-xvf",
-                target.to_str().ok_or(eyre!("Failed to convert path to string"))?,
-            ],
-        )?;
-        print!("  {}", String::from_utf8_lossy(&output.stdout));
-        return Ok(());
-    }
+    let name = make_name(target)?;
+    debug!("Generated name: {}", name);
+
+    let base = path.join(&timestamp);
+    debug!("Base path: {}", base.to_string_lossy());
+
+    execute(false, &vec!["mkdir", "-p", base.to_str().unwrap()])?;
+    debug!("Created base directory");
+
     let tarball = format!("{}.tar.gz", name);
     let metadata = format!("{}.meta", name);
 
-    let tree_path_buf = path.join(target);
-    let tree_path = tree_path_buf.to_str().ok_or(eyre!("Couldn't run tree command"))?;
-
-    let ls_path_buf = path.join(target);
-    let ls_path = ls_path_buf.to_str().ok_or(eyre!("Couldn't run ls command"))?;
-
-    let output = if path.join(target).metadata()?.is_dir() {
-        execute(sudo, &vec!["tree", "-a", "-h", "-L", "2", tree_path])?
-    } else {
-        execute(sudo, &vec!["ls", "-alh", ls_path])?
-    };
-
     let metadata_path = base.join(&metadata);
-    println!("metadata_path={}", metadata_path.to_string_lossy());
-    File::create(&metadata_path).expect("create file failed");
+    debug!("Metadata path: {}", metadata_path.to_string_lossy());
+
+    File::create(&metadata_path)?;
+    debug!("Created metadata file");
 
     let mut perms = fs::metadata(&metadata_path)?.permissions();
-    perms.set_mode(0o755); // Use octal notation for permissions
+    perms.set_mode(0o755);
     fs::set_permissions(&metadata_path, perms)?;
-
-    let mut metadata_file = OpenOptions::new().write(true).open(metadata_path)?;
-    metadata_file.write_all(&output.stdout)?;
+    debug!("Set permissions for metadata file");
 
     let output = execute(
         sudo,
@@ -214,56 +238,28 @@ fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bo
             "--preserve-permissions",
             "-cvzf",
             &tarball,
-            path.join(target)
-                .to_str()
-                .ok_or(eyre!("Failed to convert path to string"))?,
+            target.to_str().unwrap(),
         ],
     )?;
-
-    print!("  {}", String::from_utf8_lossy(&output.stdout));
+    debug!("Executed tar command");
 
     let new_tarball_path = base.join(&tarball);
     fs::rename(&tarball, &new_tarball_path)?;
-    println!("-> {}", new_tarball_path.to_string_lossy());
+    debug!("Renamed tarball");
 
-    // If sudo is true, change ownership of the tarball to the user running the script
     if sudo {
         let current_user = whoami::username();
-        execute(
-            true,
-            &vec![
-                "chown",
-                &current_user,
-                new_tarball_path
-                    .to_str()
-                    .ok_or(eyre!("Failed to convert path to string"))?,
-            ],
-        )?;
+        execute(true, &vec!["chown", &current_user, new_tarball_path.to_str().unwrap()])?;
+        debug!("Changed ownership of tarball");
     }
 
     if let Some(days) = keep {
-        let output = execute(
-            false,
-            &vec![
-                "find",
-                base.to_string_lossy().as_ref(),
-                "-mtime",
-                &format!("+{}", days),
-                "-type",
-                "d",
-                "-print",
-            ],
-        )?;
-        let deleted_dirs = String::from_utf8_lossy(&output.stdout);
-        if !deleted_dirs.trim().is_empty() {
-            println!("{}", deleted_dirs);
-            println!("-> /dev/null");
-        }
+        debug!("Keep for days: {}", days);
         execute(
             false,
             &vec![
                 "find",
-                base.to_string_lossy().as_ref(),
+                base.to_str().unwrap(),
                 "-mtime",
                 &format!("+{}", days),
                 "-type",
@@ -271,70 +267,59 @@ fn archive(path: &Path, timestamp: String, target: &Path, sudo: bool, remove: bo
                 "-delete",
             ],
         )?;
+        debug!("Executed find command for cleanup");
     }
 
-    // Debugging: Print target path before any delete operation
-    println!("Target path: {:?}", target);
-    if !target.exists() {
-        println!("Target does not exist.");
-        return Err(eyre!("Target does not exist"));
-    }
-
-    // Create a path for the new tarball
-    let tarball_path = base.join(format!("{}.tar.gz", name));
-
-    // Create and open a new file for the tarball
-    let tar_gz = File::create(&tarball_path)?;
-
-    // Create a GzEncoder with the default compression level
-    let enc = GzEncoder::new(tar_gz, Compression::default());
-
-    // Create a new tar builder
-    let mut tar = Builder::new(enc);
-
-    // Check if the target is a directory or a file
-    let metadata = fs::metadata(target)?;
-    if metadata.is_dir() {
-        // Append a directory to the tarball
-        tar.append_dir_all(name, target)?;
-    } else {
-        // Append a file to the tarball
-        tar.append_path_with_name(target, name)?;
-    }
-
-    // Finalize the tarball
-    tar.into_inner()?;
-
-    let rmrf_path = target.to_str().ok_or(eyre!("Error running rm -rf"))?;
     if remove {
-        println!("rm -rf {}", target.to_string_lossy());
+        let rmrf_path = target.to_str().unwrap();
+        debug!("Removing target: {}", rmrf_path);
         execute(sudo, &vec!["rm", "-rf", rmrf_path])?;
+        debug!("Executed rm -rf command");
     }
 
+    debug!("Exiting archive function");
     Ok(())
 }
-
 fn list_tarball_contents(tarball_path: &Path) -> Result<()> {
+    info!("fn list_tarball_contents: {}", tarball_path.display());
+
     let tar_gz = File::open(tarball_path)?;
+    debug!("Opened tarball file");
+
     let tar = flate2::read::GzDecoder::new(tar_gz);
+    debug!("Initialized GzDecoder");
+
     let mut archive = tar::Archive::new(tar);
+    debug!("Created tar archive");
 
     for file in archive.entries()? {
         let mut file = file?;
+        debug!("Reading file: {}", file.path()?.display());
+
         println!("  {}", file.path()?.display());
+        info!("Listed file: {}", file.path()?.display());
     }
 
+    debug!("Exiting list_tarball_contents function");
     Ok(())
 }
 
 fn list(dir_path: &Path, list_contents: bool) -> Result<()> {
+    info!("fn list: list_contents={}", dir_path.display());
+
     let tarballs = find_files_with_extension(dir_path, "tar.gz");
+    debug!("Found tarballs: {:?}", tarballs);
+
     for tarball in tarballs {
         let metadata = fs::metadata(&tarball)?;
         let size = metadata.len();
+        debug!("Tarball metadata: size = {}", size);
+
         println!("{:?} {}K", tarball, size / 1024);
+        info!("Listed tarball: {:?}", tarball);
 
         if list_contents {
+            debug!("Listing contents of tarball: {:?}", tarball);
             println!("Contents:");
             list_tarball_contents(&Path::new(&tarball))?;
         }
@@ -342,49 +327,92 @@ fn list(dir_path: &Path, list_contents: bool) -> Result<()> {
 
     let metadata = fs::metadata(dir_path)?;
     let size = metadata.len();
-    println!("{:?} {}K", dir_path, size / 1024);
+    debug!("Directory metadata: size = {}", size);
 
+    println!("{:?} {}K", dir_path, size / 1024);
+    info!("Listed directory: {}", dir_path.display());
+
+    debug!("Exiting list function");
     Ok(())
 }
 
 fn find_files_with_extension(dir_path: &Path, ext: &str) -> Vec<String> {
+    info!(
+        "fn find_files_with_extension: dir_path={} ext={}",
+        dir_path.display(),
+        ext
+    );
+
     let mut result = vec![];
 
     if let Ok(entries) = fs::read_dir(dir_path) {
+        debug!("Successfully read directory: {}", dir_path.display());
+
         for entry in entries {
             if let Ok(entry) = entry {
                 let path = entry.path();
+                debug!("Checking path: {}", path.display());
+
                 if path.is_file() && path.extension().unwrap() == ext {
+                    debug!("Found matching file: {}", path.display());
                     result.push(path.to_string_lossy().into_owned());
                 }
             }
         }
+    } else {
+        warn!("Failed to read directory: {}", dir_path.display());
     }
+
+    info!("Found {} files with extension: {}", result.len(), ext);
+    debug!("Exiting find_files_with_extension function");
 
     result
 }
 
 fn find_files_older_than(dir_path: &Path, days: usize) -> Vec<String> {
+    info!(
+        "fn find_files_older_than: dir_path={} days={}",
+        dir_path.display(),
+        days
+    );
+
     let now = SystemTime::now();
     let duration = std::time::Duration::from_secs((days * 24 * 60 * 60) as u64);
     let cutoff = now - duration;
+    debug!("Calculated cutoff time: {:?}", cutoff);
 
     let mut result = vec![];
 
     if let Ok(entries) = fs::read_dir(dir_path) {
+        debug!("Successfully read directory: {}", dir_path.display());
+
         for entry in entries {
             if let Ok(entry) = entry {
                 let path = entry.path();
+                debug!("Checking path: {}", path.display());
+
                 if let Ok(metadata) = fs::metadata(&path) {
                     if let Ok(modified) = metadata.modified() {
+                        debug!("File last modified at: {:?}", modified);
+
                         if modified < cutoff {
+                            debug!("Found file older than cutoff: {}", path.display());
                             result.push(path.to_string_lossy().into_owned());
                         }
+                    } else {
+                        warn!("Failed to get modified time for: {}", path.display());
                     }
+                } else {
+                    warn!("Failed to get metadata for: {}", path.display());
                 }
             }
         }
+    } else {
+        warn!("Failed to read directory: {}", dir_path.display());
     }
+
+    info!("Found {} files older than {} days", result.len(), days);
+    debug!("Exiting find_files_older_than function");
 
     result
 }
