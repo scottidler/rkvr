@@ -9,17 +9,25 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::SystemTime;
+use std::env;
 
 // Third-party crate imports
 use chrono::{Duration, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use configparser::ini::Ini;
-use dirs;
 use eyre::{eyre, Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use tar::Builder;
 use walkdir::WalkDir;
+use dirs;
+
+// Define the EXA_ARGS constant
+static EXA_ARGS: &[&str] = &[
+    "--tree", "--long", "-a",
+    "--ignore-glob=.*", "--ignore-glob=__*", "--ignore-glob=tf",
+    "--ignore-glob=venv", "--ignore-glob=target", "--ignore-glob=incremental",
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "rmrf", about = "tool for staging rmrf-ing or bkup-ing files")]
@@ -63,17 +71,6 @@ impl Default for Action {
 fn make_name(path: &str) -> Result<String> {
     debug!("Entering make_name function");
     info!("Processing path: {}", path);
-    /*
-    let name = path
-        .file_name()
-        .ok_or_else(|| eyre!("Failed to get file name"))?
-        .to_str()
-        .ok_or_else(|| eyre!("Failed to convert to str"))?
-        .to_owned()
-        .replace("/", "-")
-        .replace(":", "_")
-        .replace(" ", "_");
-    */
     let name = path
         .to_owned()
         .replace("/", "-")
@@ -287,87 +284,56 @@ fn find_files_older_than(dir_path: &Path, days: usize) -> Vec<String> {
     result
 }
 
-fn archive(path: &Path, timestamp: u64, target: &str, sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
-    info!(
-        "fn archive: path={} timestamp={} target={} sudo={} remove={} keep={:?}",
-        path.to_string_lossy(),
-        timestamp,
-        target,
-        sudo,
-        remove,
-        keep,
-    );
-
-    let name = make_name(target)?;
-    debug!("Generated name: {}", name);
-
+fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
+    let cwd = std::env::current_dir().wrap_err("Failed to get current directory")?;
     let base = path.join(timestamp.to_string());
-    debug!("Base path: {}", base.to_string_lossy());
+    fs::create_dir_all(&base)?;
 
-    execute(false, &vec!["mkdir", "-p", base.to_str().unwrap()])?;
-    debug!("Created base directory");
+    // Process each target for archival
+    for target in targets.iter().map(|t| cwd.join(t)) {
+        let parent_dir = target.parent().unwrap_or(&cwd);
+        let file_name = target.file_name().ok_or_else(|| eyre!("Failed to get file name from path"))?;
+        let tarball_name = format!("{}.tar.gz", file_name.to_string_lossy());
+        let tarball_path = base.join(&tarball_name);
 
-    let tarball = format!("{}.tar.gz", name);
-    let metadata = format!("{}.meta", name);
+        let output = if sudo {
+            Command::new("sudo").arg("tar").args(&["-czf", tarball_path.to_str().unwrap(), "-C", parent_dir.to_str().unwrap(), file_name.to_str().unwrap()]).output()
+        } else {
+            Command::new("tar").args(&["-czf", tarball_path.to_str().unwrap(), "-C", parent_dir.to_str().unwrap(), file_name.to_str().unwrap()]).output()
+        }.wrap_err("Failed to execute tar command")?;
 
-    let metadata_path = base.join(&metadata);
-    debug!("Metadata path: {}", metadata_path.to_string_lossy());
+        if !output.status.success() {
+            error!("Failed to archive {}: {:?}", target.to_string_lossy(), output);
+            continue;
+        }
 
-    File::create(&metadata_path)?;
-    debug!("Created metadata file");
-
-    let mut perms = fs::metadata(&metadata_path)?.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&metadata_path, perms)?;
-    debug!("Set permissions for metadata file");
-
-    let output = execute(
-        sudo,
-        &vec![
-            "tar",
-            "--absolute-names",
-            "--preserve-permissions",
-            "-cvzf",
-            &tarball,
-            target,
-        ],
-    )?;
-    debug!("Executed tar command");
-
-    let new_tarball_path = base.join(&tarball);
-    fs::rename(&tarball, &new_tarball_path)?;
-    debug!("Renamed tarball");
-
-    if sudo {
-        let current_user = whoami::username();
-        execute(true, &vec!["chown", &current_user, new_tarball_path.to_str().unwrap()])?;
-        debug!("Changed ownership of tarball");
+        // Optionally remove the original files/directories if specified
+        if remove {
+            if target.is_dir() {
+                fs::remove_dir_all(&target)?;
+            } else {
+                fs::remove_file(&target)?;
+            }
+        }
     }
 
+    // Generate metadata for all targets using a single `exa` command
+    let output = Command::new("exa")
+        .args(EXA_ARGS)
+        .args(targets)
+        .output()
+        .wrap_err("Failed to execute exa command")?;
+
+    let metadata_content = String::from_utf8_lossy(&output.stdout);
+
+    let metadata_path = base.join("metadata");
+    fs::write(&metadata_path, metadata_content.as_bytes()).wrap_err("Failed to write metadata file")?;
+
+    // Optionally clean up older archives based on the 'keep' parameter
     if let Some(days) = keep {
-        debug!("Keep for days: {}", days);
-        execute(
-            false,
-            &vec![
-                "find",
-                base.to_str().unwrap(),
-                "-mtime",
-                &format!("+{}", days),
-                "-type",
-                "d",
-                "-delete",
-            ],
-        )?;
-        debug!("Executed find command for cleanup");
+        cleanup(&base, days as usize)?;
     }
 
-    if remove {
-        debug!("Removing target: {}", target);
-        execute(sudo, &vec!["rm", "-rf", target])?;
-        debug!("Executed rm -rf command");
-    }
-
-    debug!("Exiting archive function");
     Ok(())
 }
 
@@ -469,14 +435,10 @@ fn main() -> Result<()> {
     match &matches.action {
         Some(action) => match action {
             Action::Bkup(args) => {
-                for target in &args.targets {
-                    archive(&bkup_path, timestamp, target, sudo, false, None)?;
-                }
+                archive(&bkup_path, timestamp, &args.targets, sudo, false, None)?;
             },
             Action::Rmrf(args) => {
-                for target in &args.targets {
-                    archive(&rmrf_path, timestamp, target, sudo, true, Some(days))?;
-                }
+                archive(&rmrf_path, timestamp, &args.targets, sudo, true, Some(days))?;
             },
             Action::LsBkup(args) => {
                 list(&bkup_path, &args.targets)?;
@@ -485,16 +447,12 @@ fn main() -> Result<()> {
                 list(&rmrf_path, &args.targets)?;
             },
             Action::BkupRmrf(args) => {
-                for target in &args.targets {
-                    archive(&bkup_path, timestamp, target, sudo, true, None)?;
-                }
+                archive(&bkup_path, timestamp, &args.targets, sudo, true, None)?;
             }
         },
         None => {
             // This is the default Rmrf action
-            for target in matches.targets {
-                archive(&rmrf_path, timestamp, &target, sudo, true, Some(days))?;
-            }
+            archive(&rmrf_path, timestamp, &matches.targets, sudo, true, Some(days))?;
         }
     }
 
