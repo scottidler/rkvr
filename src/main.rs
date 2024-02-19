@@ -12,6 +12,7 @@ use std::time::SystemTime;
 use std::env;
 
 // Third-party crate imports
+use serde::{Serialize, Deserialize};
 use chrono::{Duration, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use configparser::ini::Ini;
@@ -28,6 +29,12 @@ static EXA_ARGS: &[&str] = &[
     "--ignore-glob=.*", "--ignore-glob=__*", "--ignore-glob=tf",
     "--ignore-glob=venv", "--ignore-glob=target", "--ignore-glob=incremental",
 ];
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Metadata {
+    cwd: PathBuf,
+    contents: String,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "rmrf", about = "tool for staging rmrf-ing or bkup-ing files")]
@@ -284,8 +291,36 @@ fn find_files_older_than(dir_path: &Path, days: usize) -> Vec<String> {
     result
 }
 
-fn create_metadata(base: &Path, targets: &[String]) -> Result<()> {
-    info!("fn create_metadata: dir_path={} targets={:?}", base.display(), targets);
+fn create_metadata(base: &Path, cwd: &Path, targets: &[String]) -> Result<()> {
+    info!("fn create_metadata: base={} cwd={} targets={:?}", base.display(), cwd.display(), targets);
+
+    let output = Command::new("exa")
+        .args(EXA_ARGS)
+        .args(targets)
+        .output()
+        .wrap_err("Failed to execute exa command")?;
+
+    let metadata_content = String::from_utf8_lossy(&output.stdout);
+    debug!("Metadata content: {}", metadata_content);
+
+    // Create a Metadata instance
+    let metadata = Metadata {
+        cwd: cwd.to_path_buf(),
+        contents: metadata_content.to_string(),
+    };
+
+    // Serialize Metadata to YAML
+    let yaml_metadata = serde_yaml::to_string(&metadata).wrap_err("Failed to serialize metadata to YAML")?;
+
+    // Write the YAML metadata to the file
+    let metadata_path = base.join("metadata.yml");
+    fs::write(&metadata_path, yaml_metadata.as_bytes()).wrap_err("Failed to write metadata file")?;
+    Ok(())
+}
+
+/*
+fn create_metadata(base: &Path, cwd: &Path, targets: &[String]) -> Result<()> {
+    info!("fn create_metadata: base={} cwd={} targets={:?}", base.display(), cwd.display(), targets);
     let output = Command::new("exa")
         .args(EXA_ARGS)
         .args(targets)
@@ -299,13 +334,14 @@ fn create_metadata(base: &Path, targets: &[String]) -> Result<()> {
     fs::write(&metadata_path, metadata_content.as_bytes()).wrap_err("Failed to write metadata file")?;
     Ok(())
 }
+*/
 
 fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
     let cwd = std::env::current_dir().wrap_err("Failed to get current directory")?;
     let base = path.join(timestamp.to_string());
     fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
 
-    create_metadata(&base, targets)?;
+    create_metadata(&base, &cwd, targets)?;
 
     for target_str in targets {
         let target_path = cwd.join(target_str);
