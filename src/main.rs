@@ -25,7 +25,7 @@ use tar::Builder;
 use walkdir::WalkDir;
 use dirs;
 
-static THRESHOLD: i64 = 80;
+static THRESHOLD: i64 = 70;
 
 static EXA_ARGS: &[&str] = &[
     "--tree", "--long", "-a",
