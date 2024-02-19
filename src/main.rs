@@ -318,24 +318,6 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[String]) -> Result<()> {
     Ok(())
 }
 
-/*
-fn create_metadata(base: &Path, cwd: &Path, targets: &[String]) -> Result<()> {
-    info!("fn create_metadata: base={} cwd={} targets={:?}", base.display(), cwd.display(), targets);
-    let output = Command::new("exa")
-        .args(EXA_ARGS)
-        .args(targets)
-        .output()
-        .wrap_err("Failed to execute exa command")?;
-
-    let metadata_content = String::from_utf8_lossy(&output.stdout);
-    debug!("Metadata content: {}", metadata_content);
-
-    let metadata_path = base.join("metadata");
-    fs::write(&metadata_path, metadata_content.as_bytes()).wrap_err("Failed to write metadata file")?;
-    Ok(())
-}
-*/
-
 fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
     let cwd = std::env::current_dir().wrap_err("Failed to get current directory")?;
     let base = path.join(timestamp.to_string());
@@ -383,33 +365,23 @@ fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: 
 }
 
 fn list(dir_path: &Path, targets: &[String]) -> Result<()> {
-    println!("list: dir_path={:?}, targets={:?}", dir_path, targets);
+    // Collect all timestamp directories
+    let mut dirs: Vec<_> = fs::read_dir(dir_path)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir() && (targets.is_empty() || targets.contains(&entry.file_name().to_string_lossy().into_owned())))
+        .collect();
 
-    let dir_str = dir_path.to_str().ok_or(eyre::eyre!("Failed to convert Path to str"))?;
+    // Sort directories by timestamp in descending order
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.file_name().to_string_lossy().into_owned()));
 
-    let all_timestamps = get_all_timestamps(dir_str)?;
+    for dir in dirs {
+        let metadata_path = dir.path().join("metadata.yml");
+        if metadata_path.exists() {
+            let metadata_content = fs::read_to_string(metadata_path)?;
+            let metadata: Metadata = serde_yaml::from_str(&metadata_content)?;
 
-    let filtered_timestamps = if targets.is_empty() {
-        all_timestamps.clone()
-    } else {
-        all_timestamps
-            .into_iter()
-            .filter(|timestamp| targets.contains(timestamp))
-            .collect::<Vec<String>>()
-    };
-
-    for timestamp in filtered_timestamps {
-        println!("{}:", timestamp);
-
-        let metadata_file_path = dir_path.join(&timestamp).join("metadata.txt");
-        debug!("Metadata file path: {}", metadata_file_path.display());
-
-        let file = File::open(&metadata_file_path)?;
-        let reader = BufReader::new(file);
-
-        for line in reader.lines() {
-            let line = line?;
-            println!("  {}", line);
+            println!("{}/", dir.path().display());
+            println!("{}", metadata.contents);
         }
     }
 
