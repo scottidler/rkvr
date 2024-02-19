@@ -2,7 +2,7 @@
 
 // Standard library imports
 use log::{debug, error, info, warn};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, DirEntry};
 use std::io::prelude::*;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
@@ -377,55 +377,72 @@ fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: 
     Ok(())
 }
 
-fn list(dir_path: &Path, patterns: &[String]) -> Result<()> {
-    let matcher = SkimMatcherV2::default();
-    let dir_path = fs::canonicalize(dir_path)?;
+fn print_directory(dir_path: &Path) {
+    println!("{}/", dir_path.display());
+    if let Ok(metadata_content) = fs::read_to_string(dir_path.join("metadata.yml")) {
+        println!("{}", metadata_content);
+    }
+}
 
-    let dirs: Vec<_> = fs::read_dir(&dir_path)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir())
-        .collect();
+fn process_pattern(matcher: &SkimMatcherV2, dir_name: &str, full_path: &PathBuf, pattern: &str) -> Result<bool, std::io::Error> {
+    if matcher.fuzzy_match(dir_name, pattern).is_some() ||
+       matcher.fuzzy_match(full_path.to_str().unwrap_or_default(), pattern).is_some() {
+        return Ok(true);
+    }
 
-    let mut any_matches = false;
-
-    for dir in dirs {
-        let dir_name = dir.file_name().to_string_lossy().to_string();
-        let full_path = dir.path().canonicalize()?;
-
-        for pattern in patterns {
-            let mut match_found = false;
-
-            if matcher.fuzzy_match(&dir_name, pattern).is_some() ||
-               matcher.fuzzy_match(full_path.to_str().unwrap_or_default(), pattern).is_some() {
-                match_found = true;
-            }
-
-            let metadata_path = dir.path().join("metadata.yml");
-            if metadata_path.exists() && !match_found {
-                let metadata_content = fs::read_to_string(&metadata_path)?;
-                for line in metadata_content.lines() {
-                    if let Some(score) = matcher.fuzzy_match(line, pattern) {
-                        if score > THRESHOLD {
-                            match_found = true;
-                            break;
-                        }
-                    }
+    let metadata_path = full_path.join("metadata.yml");
+    if metadata_path.exists() {
+        let metadata_content = fs::read_to_string(&metadata_path)?;
+        for line in metadata_content.lines() {
+            if let Some(score) = matcher.fuzzy_match(line, pattern) {
+                if score > THRESHOLD {
+                    return Ok(true);
                 }
-            }
-
-            if match_found {
-                println!("{}/", dir.path().display());
-                if let Ok(metadata_content) = fs::read_to_string(dir.path().join("metadata.yml")) {
-                    println!("{}", metadata_content);
-                }
-                any_matches = true;
-                break;
             }
         }
     }
 
-    if !any_matches {
-        debug!("No matches found for the given search term(s).");
+    Ok(false)
+}
+
+fn process_directory(matcher: &SkimMatcherV2, dir: &DirEntry, patterns: &[String]) -> Result<bool, std::io::Error> {
+    let dir_name = dir.file_name().to_string_lossy().to_string();
+    let full_path = dir.path().canonicalize()?;
+
+    if !patterns.is_empty() {
+        for pattern in patterns {
+            if process_pattern(matcher, &dir_name, &full_path, pattern)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn list(dir_path: &Path, patterns: &[String]) -> Result<(), std::io::Error> {
+    let matcher = SkimMatcherV2::default();
+    let dir_path = fs::canonicalize(dir_path)?;
+
+    let mut dirs: Vec<_> = fs::read_dir(&dir_path)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+
+    dirs.reverse();
+
+    let mut any_matches = false;
+
+    for dir in &dirs {
+        if patterns.is_empty() || process_directory(&matcher, dir, &patterns)? {
+            print_directory(&dir.path());
+            any_matches = true;
+        }
+    }
+
+    if !any_matches && !patterns.is_empty() {
+        println!("No matches found for the given search term(s).");
     }
 
     Ok(())
