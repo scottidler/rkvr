@@ -12,6 +12,8 @@ use std::time::SystemTime;
 use std::env;
 
 // Third-party crate imports
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::{Serialize, Deserialize};
 use chrono::{Duration, TimeZone, Utc};
 use clap::{Parser, Subcommand};
@@ -22,6 +24,8 @@ use flate2::Compression;
 use tar::Builder;
 use walkdir::WalkDir;
 use dirs;
+
+static THRESHOLD: i64 = 80;
 
 static EXA_ARGS: &[&str] = &[
     "--tree", "--long", "-a",
@@ -373,23 +377,55 @@ fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: 
     Ok(())
 }
 
-fn list(dir_path: &Path, targets: &[String]) -> Result<()> {
-    let mut dirs: Vec<_> = fs::read_dir(dir_path)?
+fn list(dir_path: &Path, patterns: &[String]) -> Result<()> {
+    let matcher = SkimMatcherV2::default();
+    let dir_path = fs::canonicalize(dir_path)?;
+
+    let dirs: Vec<_> = fs::read_dir(&dir_path)?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir() && (targets.is_empty() || targets.contains(&entry.file_name().to_string_lossy().into_owned())))
+        .filter(|entry| entry.path().is_dir())
         .collect();
 
-    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.file_name().to_string_lossy().into_owned()));
+    let mut any_matches = false;
 
     for dir in dirs {
-        let metadata_path = dir.path().join("metadata.yml");
-        if metadata_path.exists() {
-            let metadata_content = fs::read_to_string(metadata_path)?;
-            let metadata: Metadata = serde_yaml::from_str(&metadata_content)?;
+        let dir_name = dir.file_name().to_string_lossy().to_string();
+        let full_path = dir.path().canonicalize()?;
 
-            println!("{}/", dir.path().display());
-            println!("{}", metadata.contents);
+        for pattern in patterns {
+            let mut match_found = false;
+
+            if matcher.fuzzy_match(&dir_name, pattern).is_some() ||
+               matcher.fuzzy_match(full_path.to_str().unwrap_or_default(), pattern).is_some() {
+                match_found = true;
+            }
+
+            let metadata_path = dir.path().join("metadata.yml");
+            if metadata_path.exists() && !match_found {
+                let metadata_content = fs::read_to_string(&metadata_path)?;
+                for line in metadata_content.lines() {
+                    if let Some(score) = matcher.fuzzy_match(line, pattern) {
+                        if score > THRESHOLD {
+                            match_found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if match_found {
+                println!("{}/", dir.path().display());
+                if let Ok(metadata_content) = fs::read_to_string(dir.path().join("metadata.yml")) {
+                    println!("{}", metadata_content);
+                }
+                any_matches = true;
+                break;
+            }
         }
+    }
+
+    if !any_matches {
+        debug!("No matches found for the given search term(s).");
     }
 
     Ok(())

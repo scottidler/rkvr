@@ -13,6 +13,7 @@ dirs = "3.0.2"
 env_logger = "0.10.0"
 eyre = "0.6.8"
 flate2 = "1.0.27"
+fuzzy-matcher = "0.3.7"
 libc ="0.2.144"
 log = "0.4.20"
 serde = { version = "1.0.196", features = ["derive"] }
