@@ -284,40 +284,8 @@ fn find_files_older_than(dir_path: &Path, days: usize) -> Vec<String> {
     result
 }
 
-fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
-    let cwd = std::env::current_dir().wrap_err("Failed to get current directory")?;
-    let base = path.join(timestamp.to_string());
-    fs::create_dir_all(&base)?;
-
-    // Process each target for archival
-    for target in targets.iter().map(|t| cwd.join(t)) {
-        let parent_dir = target.parent().unwrap_or(&cwd);
-        let file_name = target.file_name().ok_or_else(|| eyre!("Failed to get file name from path"))?;
-        let tarball_name = format!("{}.tar.gz", file_name.to_string_lossy());
-        let tarball_path = base.join(&tarball_name);
-
-        let output = if sudo {
-            Command::new("sudo").arg("tar").args(&["-czf", tarball_path.to_str().unwrap(), "-C", parent_dir.to_str().unwrap(), file_name.to_str().unwrap()]).output()
-        } else {
-            Command::new("tar").args(&["-czf", tarball_path.to_str().unwrap(), "-C", parent_dir.to_str().unwrap(), file_name.to_str().unwrap()]).output()
-        }.wrap_err("Failed to execute tar command")?;
-
-        if !output.status.success() {
-            error!("Failed to archive {}: {:?}", target.to_string_lossy(), output);
-            continue;
-        }
-
-        // Optionally remove the original files/directories if specified
-        if remove {
-            if target.is_dir() {
-                fs::remove_dir_all(&target)?;
-            } else {
-                fs::remove_file(&target)?;
-            }
-        }
-    }
-
-    // Generate metadata for all targets using a single `exa` command
+fn create_metadata(base: &Path, targets: &[String]) -> Result<()> {
+    info!("fn create_metadata: dir_path={} targets={:?}", base.display(), targets);
     let output = Command::new("exa")
         .args(EXA_ARGS)
         .args(targets)
@@ -325,11 +293,52 @@ fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: 
         .wrap_err("Failed to execute exa command")?;
 
     let metadata_content = String::from_utf8_lossy(&output.stdout);
+    debug!("Metadata content: {}", metadata_content);
 
     let metadata_path = base.join("metadata");
     fs::write(&metadata_path, metadata_content.as_bytes()).wrap_err("Failed to write metadata file")?;
+    Ok(())
+}
 
-    // Optionally clean up older archives based on the 'keep' parameter
+fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
+    let cwd = std::env::current_dir().wrap_err("Failed to get current directory")?;
+    let base = path.join(timestamp.to_string());
+    fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
+
+    create_metadata(&base, targets)?;
+
+    for target_str in targets {
+        let target_path = cwd.join(target_str);
+        let parent_dir = target_path.parent().unwrap_or(&cwd);
+        let file_name = target_path.file_name().ok_or_else(|| eyre!("Failed to get file name from path: {}", target_str))?;
+        let tarball_name = format!("{}.tar.gz", file_name.to_string_lossy());
+        let tarball_path = base.join(&tarball_name);
+
+        let output = if sudo {
+            Command::new("sudo")
+                .arg("tar")
+                .args(&["-czf", &tarball_path.to_string_lossy(), "-C", &parent_dir.to_string_lossy(), &file_name.to_string_lossy()])
+                .output()
+        } else {
+            Command::new("tar")
+                .args(&["-czf", &tarball_path.to_string_lossy(), "-C", &parent_dir.to_string_lossy(), &file_name.to_string_lossy()])
+                .output()
+        }.wrap_err_with(|| format!("Failed to execute tar command for {}", file_name.to_string_lossy()))?;
+
+        if !output.status.success() {
+            error!("Failed to archive {}: {:?}", target_str, output);
+            continue;
+        }
+
+        if remove {
+            if target_path.is_dir() {
+                fs::remove_dir_all(&target_path).wrap_err_with(|| format!("Failed to remove directory: {}", target_path.to_string_lossy()))?;
+            } else {
+                fs::remove_file(&target_path).wrap_err_with(|| format!("Failed to remove file: {}", target_path.to_string_lossy()))?;
+            }
+        }
+    }
+
     if let Some(days) = keep {
         cleanup(&base, days as usize)?;
     }
@@ -342,7 +351,7 @@ fn list(dir_path: &Path, targets: &[String]) -> Result<()> {
 
     let dir_str = dir_path.to_str().ok_or(eyre::eyre!("Failed to convert Path to str"))?;
 
-    let all_timestamps = get_all_timestamps(dir_str)?; // Assuming this function returns a Vec<String>
+    let all_timestamps = get_all_timestamps(dir_str)?;
 
     let filtered_timestamps = if targets.is_empty() {
         all_timestamps.clone()
@@ -356,11 +365,9 @@ fn list(dir_path: &Path, targets: &[String]) -> Result<()> {
     for timestamp in filtered_timestamps {
         println!("{}:", timestamp);
 
-        // Construct the path to the metadata file
-        let metadata_file_path = dir_path.join(&timestamp).join("metadata.txt"); // Replace with actual filename if different
+        let metadata_file_path = dir_path.join(&timestamp).join("metadata.txt");
         debug!("Metadata file path: {}", metadata_file_path.display());
 
-        // Read the metadata file
         let file = File::open(&metadata_file_path)?;
         let reader = BufReader::new(file);
 
