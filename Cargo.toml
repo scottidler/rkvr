@@ -6,18 +6,12 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-chrono = "0.4.31"
 clap = { version = "4.3.0", features = ["derive"] }
 configparser = "3.0.2"
 dirs = "3.0.2"
 env_logger = "0.10.0"
 eyre = "0.6.8"
-flate2 = "1.0.27"
 fuzzy-matcher = "0.3.7"
-libc ="0.2.144"
 log = "0.4.20"
 serde = { version = "1.0.196", features = ["derive"] }
 serde_yaml = "0.9.32"
-tar = "0.4.40"
-walkdir = "2.4.0"
-whoami = "1.4.1"

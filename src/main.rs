@@ -1,13 +1,8 @@
-#![cfg_attr(debug_assertions, allow(unused_imports, unused_variables, unused_mut, dead_code))]
-
 // Standard library imports
-use log::{debug, error, info, warn};
-use std::fs::{self, File, OpenOptions, DirEntry};
-use std::io::prelude::*;
-use std::io::{BufRead, BufReader};
-use std::os::unix::fs::PermissionsExt;
+use log::{debug, info, warn};
+use std::fs::{self, DirEntry};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 use std::time::SystemTime;
 use std::env;
 
@@ -15,17 +10,10 @@ use std::env;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::{Serialize, Deserialize};
-use chrono::{Duration, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use configparser::ini::Ini;
 use eyre::{eyre, Context, Result};
-use flate2::write::GzEncoder;
-use flate2::Compression;
-use tar::Builder;
-use walkdir::WalkDir;
 use dirs;
-
-static THRESHOLD: i64 = 70;
 
 static EXA_ARGS: &[&str] = &[
     "--tree", "--long", "-a",
@@ -78,42 +66,6 @@ impl Default for Action {
     }
 }
 
-fn make_name(path: &str) -> Result<String> {
-    debug!("Entering make_name function");
-    info!("Processing path: {}", path);
-    let name = path
-        .to_owned()
-        .replace("/", "-")
-        .replace(":", "_")
-        .replace(" ", "_");
-
-    debug!("Generated name: {}", name);
-    Ok(name)
-}
-
-fn execute<T: AsRef<str> + std::fmt::Debug>(sudo: bool, args: &[T]) -> Result<Output> {
-    info!("execute: sudo={}, args={:?}", sudo, args);
-
-    let mut command = Command::new(if sudo { "sudo" } else { args[0].as_ref() });
-
-    if sudo {
-        command.arg(args[0].as_ref());
-    }
-
-    for arg in args[1..].iter() {
-        command.arg(arg.as_ref());
-    }
-
-    let output = command.output().map_err(|e| eyre!(e));
-
-    match &output {
-        Ok(o) => debug!("Command executed successfully with output: {:?}", o),
-        Err(e) => error!("Command execution failed with error: {:?}", e),
-    }
-
-    output
-}
-
 fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
     info!("fn cleanup: dir_path={} days={}", dir_path.to_string_lossy(), days);
 
@@ -152,146 +104,6 @@ fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
 
     info!("Cleanup completed");
     Ok(())
-}
-
-fn list_tarball_contents(tarball_path: &Path) -> Result<()> {
-    info!("fn list_tarball_contents: {}", tarball_path.display());
-
-    let tar_gz = File::open(tarball_path)?;
-    debug!("Opened tarball file");
-
-    let tar = flate2::read::GzDecoder::new(tar_gz);
-    debug!("Initialized GzDecoder");
-
-    let mut archive = tar::Archive::new(tar);
-    debug!("Created tar archive");
-
-    for file in archive.entries()? {
-        let mut file = file?;
-        debug!("Reading file: {}", file.path()?.display());
-
-        println!("  {}", file.path()?.display());
-        info!("Listed file: {}", file.path()?.display());
-    }
-
-    debug!("Exiting list_tarball_contents function");
-    Ok(())
-}
-
-fn get_all_timestamps(dir: &str) -> Result<Vec<String>> {
-    (|| -> Result<Vec<String>> {
-        Ok(fs::read_dir(dir)?
-            .filter_map(|entry| {
-                entry
-                    .as_ref()
-                    .ok()
-                    .and_then(|e| e.file_type().ok())
-                    .filter(|&ft| ft.is_dir())
-                    .and_then(|_| entry.ok())
-                    .and_then(|e| e.path().file_name().map(|s| s.to_os_string()))
-                    .and_then(|s| s.into_string().ok())
-            })
-            .collect::<Vec<String>>())
-    })()
-    .wrap_err_with(|| eyre!("Failed to get all timestamps from directory: {}", dir))
-}
-
-fn list_all(dir_path: &Path) -> Result<()> {
-    info!("Listing all items in directory: {}", dir_path.display());
-
-    let entries = fs::read_dir(dir_path)?;
-    for entry in entries {
-        if let Ok(entry) = entry {
-            let path = entry.path();
-            let metadata = fs::metadata(&path)?;
-            let size = metadata.len();
-            println!("{:?} {}K", path, size / 1024);
-            info!("Listed item: {:?}", path);
-        }
-    }
-
-    Ok(())
-}
-
-fn find_files_with_extension(dir_path: &Path, ext: &str) -> Vec<String> {
-    info!(
-        "fn find_files_with_extension: dir_path={} ext={}",
-        dir_path.display(),
-        ext
-    );
-
-    let mut result = vec![];
-
-    if let Ok(entries) = fs::read_dir(dir_path) {
-        debug!("Successfully read directory: {}", dir_path.display());
-
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                debug!("Checking path: {}", path.display());
-
-                if path.is_file() && path.extension().unwrap() == ext {
-                    debug!("Found matching file: {}", path.display());
-                    result.push(path.to_string_lossy().into_owned());
-                }
-            }
-        }
-    } else {
-        warn!("Failed to read directory: {}", dir_path.display());
-    }
-
-    info!("Found {} files with extension: {}", result.len(), ext);
-    debug!("Exiting find_files_with_extension function");
-
-    result
-}
-
-fn find_files_older_than(dir_path: &Path, days: usize) -> Vec<String> {
-    info!(
-        "fn find_files_older_than: dir_path={} days={}",
-        dir_path.display(),
-        days
-    );
-
-    let now = SystemTime::now();
-    let duration = std::time::Duration::from_secs((days * 24 * 60 * 60) as u64);
-    let cutoff = now - duration;
-    debug!("Calculated cutoff time: {:?}", cutoff);
-
-    let mut result = vec![];
-
-    if let Ok(entries) = fs::read_dir(dir_path) {
-        debug!("Successfully read directory: {}", dir_path.display());
-
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                debug!("Checking path: {}", path.display());
-
-                if let Ok(metadata) = fs::metadata(&path) {
-                    if let Ok(modified) = metadata.modified() {
-                        debug!("File last modified at: {:?}", modified);
-
-                        if modified < cutoff {
-                            debug!("Found file older than cutoff: {}", path.display());
-                            result.push(path.to_string_lossy().into_owned());
-                        }
-                    } else {
-                        warn!("Failed to get modified time for: {}", path.display());
-                    }
-                } else {
-                    warn!("Failed to get metadata for: {}", path.display());
-                }
-            }
-        }
-    } else {
-        warn!("Failed to read directory: {}", dir_path.display());
-    }
-
-    info!("Found {} files older than {} days", result.len(), days);
-    debug!("Exiting find_files_older_than function");
-
-    result
 }
 
 fn create_metadata(base: &Path, cwd: &Path, targets: &[String]) -> Result<()> {
@@ -356,7 +168,7 @@ fn remove_targets(base: &Path, targets: &[PathBuf]) -> Result<()> {
 }
 
 fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
-    let cwd = std::env::current_dir().wrap_err("Failed to get current directory")?;
+    let cwd = env::current_dir().wrap_err("Failed to get current directory")?;
     let base = path.join(timestamp.to_string());
     fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
 
@@ -384,7 +196,7 @@ fn print_directory(dir_path: &Path) {
     }
 }
 
-fn process_pattern(matcher: &SkimMatcherV2, dir_name: &str, full_path: &PathBuf, pattern: &str) -> Result<bool, std::io::Error> {
+fn process_pattern(matcher: &SkimMatcherV2, dir_name: &str, full_path: &PathBuf, pattern: &str, threshold: i64) -> Result<bool, std::io::Error> {
     if matcher.fuzzy_match(dir_name, pattern).is_some() ||
        matcher.fuzzy_match(full_path.to_str().unwrap_or_default(), pattern).is_some() {
         return Ok(true);
@@ -395,7 +207,7 @@ fn process_pattern(matcher: &SkimMatcherV2, dir_name: &str, full_path: &PathBuf,
         let metadata_content = fs::read_to_string(&metadata_path)?;
         for line in metadata_content.lines() {
             if let Some(score) = matcher.fuzzy_match(line, pattern) {
-                if score > THRESHOLD {
+                if score > threshold {
                     return Ok(true);
                 }
             }
@@ -405,13 +217,13 @@ fn process_pattern(matcher: &SkimMatcherV2, dir_name: &str, full_path: &PathBuf,
     Ok(false)
 }
 
-fn process_directory(matcher: &SkimMatcherV2, dir: &DirEntry, patterns: &[String]) -> Result<bool, std::io::Error> {
+fn process_directory(matcher: &SkimMatcherV2, dir: &DirEntry, patterns: &[String], threshold: i64) -> Result<bool, std::io::Error> {
     let dir_name = dir.file_name().to_string_lossy().to_string();
     let full_path = dir.path().canonicalize()?;
 
     if !patterns.is_empty() {
         for pattern in patterns {
-            if process_pattern(matcher, &dir_name, &full_path, pattern)? {
+            if process_pattern(matcher, &dir_name, &full_path, pattern, threshold)? {
                 return Ok(true);
             }
         }
@@ -421,7 +233,7 @@ fn process_directory(matcher: &SkimMatcherV2, dir: &DirEntry, patterns: &[String
     Ok(true)
 }
 
-fn list(dir_path: &Path, patterns: &[String]) -> Result<(), std::io::Error> {
+fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<(), std::io::Error> {
     let matcher = SkimMatcherV2::default();
     let dir_path = fs::canonicalize(dir_path)?;
 
@@ -435,14 +247,14 @@ fn list(dir_path: &Path, patterns: &[String]) -> Result<(), std::io::Error> {
     let mut any_matches = false;
 
     for dir in &dirs {
-        if patterns.is_empty() || process_directory(&matcher, dir, &patterns)? {
+        if patterns.is_empty() || process_directory(&matcher, dir, &patterns, threshold)? {
             print_directory(&dir.path());
             any_matches = true;
         }
     }
 
     if !any_matches && !patterns.is_empty() {
-        println!("No matches found for the given search term(s).");
+        warn!("No matches found for the given search term(s).");
     }
 
     Ok(())
@@ -495,10 +307,11 @@ fn main() -> Result<()> {
 
     let sudo: bool = rmrf_cfg.get("DEFAULT", "sudo").unwrap_or("yes".to_owned()) == "yes";
     let days: i32 = rmrf_cfg.get("DEFAULT", "keep").unwrap_or("21".to_owned()).parse()?;
+    let threshold: i64 = rmrf_cfg.get("DEFAULT", "threshold").unwrap_or("70".to_owned()).parse()?;
 
     info!(
-        "Configuration - rmrf_path: {:?}, bkup_path: {:?}, sudo: {}, keep for days: {}",
-        rmrf_path, bkup_path, sudo, days
+        "Configuration - rmrf_path: {:?}, bkup_path: {:?}, sudo: {}, keep for days: {}, threshold: {}",
+        rmrf_path, bkup_path, sudo, days, threshold,
     );
 
     debug!("rmrf_path: {:?}, bkup_path: {:?}", rmrf_path, bkup_path);
@@ -516,10 +329,10 @@ fn main() -> Result<()> {
                 archive(&rmrf_path, timestamp, &args.targets, sudo, true, Some(days))?;
             },
             Action::LsBkup(args) => {
-                list(&bkup_path, &args.targets)?;
+                list(&bkup_path, &args.targets, threshold)?;
             },
             Action::LsRmrf(args) => {
-                list(&rmrf_path, &args.targets)?;
+                list(&rmrf_path, &args.targets, threshold)?;
             },
             Action::BkupRmrf(args) => {
                 archive(&bkup_path, timestamp, &args.targets, sudo, true, None)?;
