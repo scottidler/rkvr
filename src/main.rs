@@ -233,7 +233,7 @@ fn process_directory(matcher: &SkimMatcherV2, dir: &DirEntry, patterns: &[String
     Ok(true)
 }
 
-fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<(), std::io::Error> {
+fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<()> {
     let matcher = SkimMatcherV2::default();
     let dir_path = fs::canonicalize(dir_path)?;
 
@@ -242,7 +242,7 @@ fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<(), std:
         .filter(|entry| entry.path().is_dir())
         .collect();
 
-    dirs.reverse();
+    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
 
     let mut any_matches = false;
 
