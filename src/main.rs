@@ -1,6 +1,8 @@
+#![allow(unused_variables)]
+
 // Standard library imports
-use log::{debug, info, warn};
-use std::fs::{self, DirEntry};
+use log::{debug, info, warn, error};
+use std::fs::{self, File, DirEntry};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
@@ -52,6 +54,8 @@ enum Action {
     Bkup(Args),
     #[command(about = "rmrf files [default]")]
     Rmrf(Args),
+    #[command(about = "recover rmrf|bkup files")]
+    Rcvr(Args),
     #[command(about = "list bkup files")]
     LsBkup(Args),
     #[command(about = "list rmrf files")]
@@ -260,6 +264,96 @@ fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<()> {
     Ok(())
 }
 
+// given the following timestamp directory:
+// ~ via 🐍 v3.10.12 via 🦀 v1.76.0 on ☁️  (us-west-2) on ☁️
+// ❯ tree -a -I '.*|__*|tf|venv|target|incremental' /var/tmp/rmrf2/1708380459/
+// /var/tmp/rmrf2/1708380459/
+// ├── apple.tar.gz
+// ├── banana.tar.gz
+// └── metadata.yml
+//
+// The user can supply one of the following targets to recover:
+// /var/tmp/rmrf2/1708380459/   this will recover all of the files: apple.tar.gz, banana.tar.gz
+//
+// After the files have been successfully recovered, the program will remove the timestamp directory.
+//
+// The process should be the same, get the recovery path by getting the cwd value by loading the
+// metata.yml file. Then the untar should place the files relative to the cwd value.
+fn recover(dir: &Path, targets: &[String]) -> Result<()> {
+    let dir = dir.canonicalize().wrap_err("Failed to canonicalize rmrf path")?;
+    debug!("recover: dir={} targets={}", dir.display(), targets.join(", "));
+
+    for target in targets {
+        let target_path = Path::new(target);
+        debug!("target_path={}", target_path.display());
+
+        let target_path = if target_path.is_absolute() {
+            target_path.canonicalize().wrap_err("Failed to canonicalize target path")?
+        } else {
+            dir.join(target_path).canonicalize().wrap_err("Failed to canonicalize combined target path")?
+        };
+        debug!("canonical target_path={}", target_path.display());
+
+        if !target_path.starts_with(&dir) {
+            error!("Target path is not within the specified directory: {}", target_path.display());
+            continue;
+        }
+
+        let metadata_path = target_path.join("metadata.yml");
+        debug!("metadata_path={}", metadata_path.display());
+        let metadata: Metadata = serde_yaml::from_reader(File::open(&metadata_path).wrap_err("Failed to open metadata.yml")?)?;
+
+        let tarballs = find_tarballs(&target_path);
+        debug!("tarballs={:?}", tarballs);
+
+        for entry in tarballs {
+            extract_tarball(&entry.as_path(), &metadata.cwd)?;
+        }
+
+        fs::remove_dir_all(&target_path).wrap_err("Failed to remove the target directory after recovery")?;
+    }
+
+    Ok(())
+}
+
+fn find_tarballs(dir_path: &Path) -> Vec<PathBuf> {
+    debug!("find_tarballs: dir_path={}", dir_path.display());
+    let mut tarballs = Vec::new();
+    if dir_path.is_dir() {
+        for entry in fs::read_dir(dir_path).expect("Directory not found") {
+            let entry = entry.expect("Failed to read entry");
+            let path = entry.path();
+            if path.is_file() && is_tar_gz(&path) {
+                tarballs.push(path);
+            } else {
+                debug!("Skipping non-tarball file: {}", path.display());
+            }
+        }
+    }
+    tarballs
+}
+
+// Checks if the file has a .tar.gz extension
+fn is_tar_gz(path: &Path) -> bool {
+    match path.to_str() {
+        Some(s) => s.ends_with(".tar.gz"),
+        None => false,
+    }
+}
+
+fn extract_tarball(tarball_path: &Path, destination: &Path) -> Result<()> {
+    Command::new("tar")
+        .arg("-xzf")
+        .arg(tarball_path)
+        .arg("-C")
+        .arg(destination)
+        .status()
+        .wrap_err_with(|| format!("Failed to extract tarball: {}", tarball_path.display()))?;
+
+    info!("Successfully recovered {}", tarball_path.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let args = std::env::args().collect::<Vec<String>>();
@@ -275,13 +369,7 @@ fn main() -> Result<()> {
     debug!("CLI arguments parsed: {:?}", matches);
 
     let action: Action = matches.action.clone().unwrap_or_default();
-    let targets: Vec<PathBuf> = matches
-        .targets
-        .iter()
-        .map(|f| fs::canonicalize(f).unwrap().to_string_lossy().into_owned())
-        .map(|f| PathBuf::from(f))
-        .collect();
-    info!("Action: {:?}, Targets: {:?}", action, targets);
+    info!("Action: {:?}", action);
 
     let rmrf_cfg_path = dirs::home_dir()
         .ok_or(eyre!("home dir not found!"))?
@@ -327,6 +415,9 @@ fn main() -> Result<()> {
             },
             Action::Rmrf(args) => {
                 archive(&rmrf_path, timestamp, &args.targets, sudo, true, Some(days))?;
+            },
+            Action::Rcvr(args) => {
+                recover(&rmrf_path, &args.targets)?;
             },
             Action::LsBkup(args) => {
                 list(&bkup_path, &args.targets, threshold)?;
