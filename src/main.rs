@@ -29,6 +29,10 @@ struct Metadata {
     contents: String,
 }
 
+fn as_paths(paths: &[String]) -> Vec<PathBuf> {
+    paths.iter().map(PathBuf::from).collect()
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "rmrf", about = "tool for staging rmrf-ing or bkup-ing files")]
 #[command(version = "0.1.0")]
@@ -110,6 +114,30 @@ fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
     Ok(())
 }
 
+fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
+    info!("fn create_metadata: base={} cwd={} targets={:?}", base.display(), cwd.display(), targets);
+
+    let output = Command::new("exa")
+        .args(EXA_ARGS)
+        .args(targets.iter().map(|t| t.to_str().unwrap())) // Adjusted to convert PathBuf to &str
+        .output()
+        .wrap_err("Failed to execute exa command")?;
+
+    let metadata_content = String::from_utf8_lossy(&output.stdout);
+    debug!("Metadata content: {}", metadata_content);
+
+    let metadata = Metadata {
+        cwd: cwd.to_path_buf(),
+        contents: metadata_content.to_string(),
+    };
+
+    let yaml_metadata = serde_yaml::to_string(&metadata).wrap_err("Failed to serialize metadata to YAML")?;
+    let metadata_path = base.join("metadata.yml");
+    fs::write(&metadata_path, yaml_metadata.as_bytes()).wrap_err("Failed to write metadata file")?;
+    Ok(())
+}
+
+/*
 fn create_metadata(base: &Path, cwd: &Path, targets: &[String]) -> Result<()> {
     info!("fn create_metadata: base={} cwd={} targets={:?}", base.display(), cwd.display(), targets);
 
@@ -132,7 +160,33 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[String]) -> Result<()> {
     fs::write(&metadata_path, yaml_metadata.as_bytes()).wrap_err("Failed to write metadata file")?;
     Ok(())
 }
+*/
 
+fn archive_target(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> Result<PathBuf> {
+    let target_path = cwd.join(target);
+    let parent_dir = target_path.parent().unwrap_or(cwd);
+    let file_name = target_path.file_name().ok_or_else(|| eyre!("Failed to get file name from path: {}", target.display()))?;
+    let tarball_name = format!("{}.tar.gz", file_name.to_string_lossy());
+    let tarball_path = base.join(&tarball_name);
+
+    let output = if sudo {
+        Command::new("sudo")
+            .arg("tar")
+            .args(&["-czf", tarball_path.to_str().unwrap(), "-C", parent_dir.to_str().unwrap(), file_name.to_str().unwrap()])
+            .output()
+    } else {
+        Command::new("tar")
+            .args(&["-czf", tarball_path.to_str().unwrap(), "-C", parent_dir.to_str().unwrap(), file_name.to_str().unwrap()])
+            .output()
+    }.wrap_err_with(|| format!("Failed to execute tar command for {}", file_name.to_string_lossy()))?;
+
+    if !output.status.success() {
+        eyre::bail!("Failed to archive {}", file_name.to_string_lossy());
+    }
+
+    Ok(target_path)
+}
+/*
 fn archive_target(base: &Path, target_str: &str, sudo: bool, cwd: &Path) -> Result<PathBuf> {
     let target_path = cwd.join(target_str);
     let parent_dir = target_path.parent().unwrap_or(cwd);
@@ -157,20 +211,31 @@ fn archive_target(base: &Path, target_str: &str, sudo: bool, cwd: &Path) -> Resu
 
     Ok(target_path)
 }
+*/
 
-fn remove_targets(base: &Path, targets: &[PathBuf]) -> Result<()> {
-    for target in targets {
-        if target.is_dir() {
-            fs::remove_dir_all(target)?;
-        } else {
-            fs::remove_file(target)?;
-        }
-        println!("{}", target.display());
+fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
+    let cwd = env::current_dir().wrap_err("Failed to get current directory")?;
+    let base = path.join(timestamp.to_string());
+    fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
+
+    create_metadata(&base, &cwd, targets)?;
+
+    let target_paths: Vec<_> = targets.iter()
+        .map(|target| archive_target(&base, target, sudo, &cwd))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if remove {
+        remove_targets(&base, &target_paths)?;
     }
-    println!("-> {}/", base.display());
+
+    if let Some(days) = keep {
+        cleanup(&base, days as usize)?;
+    }
+
     Ok(())
 }
 
+/*
 fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
     let cwd = env::current_dir().wrap_err("Failed to get current directory")?;
     let base = path.join(timestamp.to_string());
@@ -190,6 +255,19 @@ fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: 
         cleanup(&base, days as usize)?;
     }
 
+    Ok(())
+}
+*/
+fn remove_targets(base: &Path, targets: &[PathBuf]) -> Result<()> {
+    for target in targets {
+        if target.is_dir() {
+            fs::remove_dir_all(target)?;
+        } else {
+            fs::remove_file(target)?;
+        }
+        println!("{}", target.display());
+    }
+    println!("-> {}/", base.display());
     Ok(())
 }
 
@@ -279,6 +357,44 @@ fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<()> {
 //
 // The process should be the same, get the recovery path by getting the cwd value by loading the
 // metata.yml file. Then the untar should place the files relative to the cwd value.
+
+fn recover(dir: &Path, targets: &[PathBuf]) -> Result<()> {
+    let dir = dir.canonicalize().wrap_err("Failed to canonicalize rmrf path")?;
+    debug!("recover: dir={} targets={}", dir.display(), targets.iter().map(|t| t.to_string_lossy()).collect::<Vec<_>>().join(", "));
+
+    for target in targets {
+        debug!("target_path={}", target.display());
+
+        let target_path = if target.is_absolute() {
+            target.canonicalize().wrap_err("Failed to canonicalize target path")?
+        } else {
+            dir.join(target).canonicalize().wrap_err("Failed to canonicalize combined target path")?
+        };
+        debug!("canonical target_path={}", target_path.display());
+
+        if !target_path.starts_with(&dir) {
+            error!("Target path is not within the specified directory: {}", target_path.display());
+            continue;
+        }
+
+        let metadata_path = target_path.join("metadata.yml");
+        debug!("metadata_path={}", metadata_path.display());
+        let metadata: Metadata = serde_yaml::from_reader(File::open(&metadata_path).wrap_err("Failed to open metadata.yml")?)?;
+
+        let tarballs = find_tarballs(&target_path);
+        debug!("tarballs={:?}", tarballs);
+
+        for entry in tarballs {
+            extract_tarball(&entry.as_path(), &metadata.cwd)?;
+        }
+
+        fs::remove_dir_all(&target_path).wrap_err("Failed to remove the target directory after recovery")?;
+    }
+
+    Ok(())
+}
+
+/*
 fn recover(dir: &Path, targets: &[String]) -> Result<()> {
     let dir = dir.canonicalize().wrap_err("Failed to canonicalize rmrf path")?;
     debug!("recover: dir={} targets={}", dir.display(), targets.join(", "));
@@ -315,7 +431,7 @@ fn recover(dir: &Path, targets: &[String]) -> Result<()> {
 
     Ok(())
 }
-
+*/
 fn find_tarballs(dir_path: &Path) -> Vec<PathBuf> {
     debug!("find_tarballs: dir_path={}", dir_path.display());
     let mut tarballs = Vec::new();
@@ -411,13 +527,13 @@ fn main() -> Result<()> {
     match &matches.action {
         Some(action) => match action {
             Action::Bkup(args) => {
-                archive(&bkup_path, timestamp, &args.targets, sudo, false, None)?;
+                archive(&bkup_path, timestamp, &as_paths(&args.targets), sudo, false, None)?;
             },
             Action::Rmrf(args) => {
-                archive(&rmrf_path, timestamp, &args.targets, sudo, true, Some(days))?;
+                archive(&rmrf_path, timestamp, &as_paths(&args.targets), sudo, true, Some(days))?;
             },
             Action::Rcvr(args) => {
-                recover(&rmrf_path, &args.targets)?;
+                recover(&rmrf_path, &as_paths(&args.targets))?;
             },
             Action::LsBkup(args) => {
                 list(&bkup_path, &args.targets, threshold)?;
@@ -426,12 +542,12 @@ fn main() -> Result<()> {
                 list(&rmrf_path, &args.targets, threshold)?;
             },
             Action::BkupRmrf(args) => {
-                archive(&bkup_path, timestamp, &args.targets, sudo, true, None)?;
+                archive(&bkup_path, timestamp, &as_paths(&args.targets), sudo, true, None)?;
             }
         },
         None => {
             // This is the default Rmrf action
-            archive(&rmrf_path, timestamp, &matches.targets, sudo, true, Some(days))?;
+            archive(&rmrf_path, timestamp, &as_paths(&matches.targets), sudo, true, Some(days))?;
         }
     }
 
