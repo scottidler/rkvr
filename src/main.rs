@@ -137,31 +137,6 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/*
-fn create_metadata(base: &Path, cwd: &Path, targets: &[String]) -> Result<()> {
-    info!("fn create_metadata: base={} cwd={} targets={:?}", base.display(), cwd.display(), targets);
-
-    let output = Command::new("exa")
-        .args(EXA_ARGS)
-        .args(targets)
-        .output()
-        .wrap_err("Failed to execute exa command")?;
-
-    let metadata_content = String::from_utf8_lossy(&output.stdout);
-    debug!("Metadata content: {}", metadata_content);
-
-    let metadata = Metadata {
-        cwd: cwd.to_path_buf(),
-        contents: metadata_content.to_string(),
-    };
-
-    let yaml_metadata = serde_yaml::to_string(&metadata).wrap_err("Failed to serialize metadata to YAML")?;
-    let metadata_path = base.join("metadata.yml");
-    fs::write(&metadata_path, yaml_metadata.as_bytes()).wrap_err("Failed to write metadata file")?;
-    Ok(())
-}
-*/
-
 fn archive_target(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> Result<PathBuf> {
     let target_path = cwd.join(target);
     let parent_dir = target_path.parent().unwrap_or(cwd);
@@ -186,32 +161,6 @@ fn archive_target(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> Resu
 
     Ok(target_path)
 }
-/*
-fn archive_target(base: &Path, target_str: &str, sudo: bool, cwd: &Path) -> Result<PathBuf> {
-    let target_path = cwd.join(target_str);
-    let parent_dir = target_path.parent().unwrap_or(cwd);
-    let file_name = target_path.file_name().ok_or_else(|| eyre!("Failed to get file name from path: {}", target_str))?;
-    let tarball_name = format!("{}.tar.gz", file_name.to_string_lossy());
-    let tarball_path = base.join(&tarball_name);
-
-    let output = if sudo {
-        Command::new("sudo")
-            .arg("tar")
-            .args(&["-czf", tarball_path.to_str().unwrap(), "-C", parent_dir.to_str().unwrap(), file_name.to_str().unwrap()])
-            .output()
-    } else {
-        Command::new("tar")
-            .args(&["-czf", tarball_path.to_str().unwrap(), "-C", parent_dir.to_str().unwrap(), file_name.to_str().unwrap()])
-            .output()
-    }.wrap_err_with(|| format!("Failed to execute tar command for {}", file_name.to_string_lossy()))?;
-
-    if !output.status.success() {
-        eyre::bail!("Failed to archive {}", file_name.to_string_lossy());
-    }
-
-    Ok(target_path)
-}
-*/
 
 fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
     let cwd = env::current_dir().wrap_err("Failed to get current directory")?;
@@ -235,29 +184,6 @@ fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove:
     Ok(())
 }
 
-/*
-fn archive(path: &Path, timestamp: u64, targets: &[String], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
-    let cwd = env::current_dir().wrap_err("Failed to get current directory")?;
-    let base = path.join(timestamp.to_string());
-    fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
-
-    create_metadata(&base, &cwd, targets)?;
-
-    let target_paths: Vec<_> = targets.iter()
-        .map(|target_str| archive_target(&base, target_str, sudo, &cwd))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if remove {
-        remove_targets(&base, &target_paths)?;
-    }
-
-    if let Some(days) = keep {
-        cleanup(&base, days as usize)?;
-    }
-
-    Ok(())
-}
-*/
 fn remove_targets(base: &Path, targets: &[PathBuf]) -> Result<()> {
     for target in targets {
         if target.is_dir() {
@@ -394,44 +320,6 @@ fn recover(dir: &Path, targets: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/*
-fn recover(dir: &Path, targets: &[String]) -> Result<()> {
-    let dir = dir.canonicalize().wrap_err("Failed to canonicalize rmrf path")?;
-    debug!("recover: dir={} targets={}", dir.display(), targets.join(", "));
-
-    for target in targets {
-        let target_path = Path::new(target);
-        debug!("target_path={}", target_path.display());
-
-        let target_path = if target_path.is_absolute() {
-            target_path.canonicalize().wrap_err("Failed to canonicalize target path")?
-        } else {
-            dir.join(target_path).canonicalize().wrap_err("Failed to canonicalize combined target path")?
-        };
-        debug!("canonical target_path={}", target_path.display());
-
-        if !target_path.starts_with(&dir) {
-            error!("Target path is not within the specified directory: {}", target_path.display());
-            continue;
-        }
-
-        let metadata_path = target_path.join("metadata.yml");
-        debug!("metadata_path={}", metadata_path.display());
-        let metadata: Metadata = serde_yaml::from_reader(File::open(&metadata_path).wrap_err("Failed to open metadata.yml")?)?;
-
-        let tarballs = find_tarballs(&target_path);
-        debug!("tarballs={:?}", tarballs);
-
-        for entry in tarballs {
-            extract_tarball(&entry.as_path(), &metadata.cwd)?;
-        }
-
-        fs::remove_dir_all(&target_path).wrap_err("Failed to remove the target directory after recovery")?;
-    }
-
-    Ok(())
-}
-*/
 fn find_tarballs(dir_path: &Path) -> Vec<PathBuf> {
     debug!("find_tarballs: dir_path={}", dir_path.display());
     let mut tarballs = Vec::new();
@@ -449,7 +337,6 @@ fn find_tarballs(dir_path: &Path) -> Vec<PathBuf> {
     tarballs
 }
 
-// Checks if the file has a .tar.gz extension
 fn is_tar_gz(path: &Path) -> bool {
     match path.to_str() {
         Some(s) => s.ends_with(".tar.gz"),
