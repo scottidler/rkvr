@@ -1,11 +1,10 @@
-#![allow(unused_variables)]
-
 // Standard library imports
 use log::{debug, info, warn, error};
 use std::fs::{self, File, DirEntry};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
+use std::collections::HashMap;
 use std::env;
 
 // Third-party crate imports
@@ -119,7 +118,7 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
 
     let output = Command::new("exa")
         .args(EXA_ARGS)
-        .args(targets.iter().map(|t| t.to_str().unwrap())) // Adjusted to convert PathBuf to &str
+        .args(targets.iter().map(|t| t.to_str().unwrap()))
         .output()
         .wrap_err("Failed to execute exa command")?;
 
@@ -137,29 +136,99 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn archive_target(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> Result<PathBuf> {
+fn archive_directory(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> Result<PathBuf> {
     let target_path = cwd.join(target);
-    let parent_dir = target_path.parent().unwrap_or(cwd);
-    let file_name = target_path.file_name().ok_or_else(|| eyre!("Failed to get file name from path: {}", target.display()))?;
-    let tarball_name = format!("{}.tar.gz", file_name.to_string_lossy());
+    let dir_name = target.file_name().ok_or_else(|| eyre!("Failed to extract directory/file name"))?;
+    let tarball_name = format!("{}.tar.gz", dir_name.to_string_lossy());
     let tarball_path = base.join(&tarball_name);
 
+    debug!("Archiving directory/file: {}", target_path.display());
+    debug!("Tarball will be saved as: {}", tarball_path.display());
+
+    // The -C flag changes the working directory to `cwd` before starting the operation.
+    // The `.` specifies to include the target directory/file relative to `cwd`.
     let output = if sudo {
         Command::new("sudo")
             .arg("tar")
-            .args(&["-czf", tarball_path.to_str().unwrap(), "-C", parent_dir.to_str().unwrap(), file_name.to_str().unwrap()])
+            .args(&["-czf", tarball_path.to_str().unwrap(), "-C", cwd.to_str().unwrap(), &format!("{}", target.to_string_lossy())])
             .output()
     } else {
         Command::new("tar")
-            .args(&["-czf", tarball_path.to_str().unwrap(), "-C", parent_dir.to_str().unwrap(), file_name.to_str().unwrap()])
+            .args(&["-czf", tarball_path.to_str().unwrap(), "-C", cwd.to_str().unwrap(), &format!("{}", target.to_string_lossy())])
             .output()
-    }.wrap_err_with(|| format!("Failed to execute tar command for {}", file_name.to_string_lossy()))?;
+    }.wrap_err_with(|| format!("Failed to execute tar command for {}", target_path.to_string_lossy()))?;
 
     if !output.status.success() {
-        eyre::bail!("Failed to archive {}", file_name.to_string_lossy());
+        let error_message = String::from_utf8_lossy(&output.stderr);
+        debug!("Tar command failed with error: {}", error_message);
+        eyre::bail!("Failed to archive {}", target.to_string_lossy());
     }
 
     Ok(target_path)
+}
+
+fn archive_group(base: &Path, group: &[PathBuf], sudo: bool, cwd: &Path) -> Result<()> {
+    if group.is_empty() {
+        error!("An empty slice of files was passed to archive_group, indicating a critical error in the program logic.");
+        return Err(eyre!("An empty slice of files was passed to archive_group, indicating a critical error in the program logic."));
+    }
+
+    let group_name = group.first().and_then(|path| path.parent()).and_then(|p| p.file_name())
+        .ok_or_else(|| eyre!("Failed to derive group name"))?
+        .to_string_lossy();
+    let tarball_name = format!("{}.tar.gz", group_name);
+    let tarball_path = base.join(&tarball_name);
+
+    // The `-C` option changes the working directory before starting the operation
+    // Here, it's changed to `cwd` and then paths are added relative to this directory
+    let tar_args: Vec<String> = group.iter().map(|path| path.to_string_lossy().into_owned()).collect();
+
+    let output = if sudo {
+        let mut cmd = Command::new("sudo");
+        cmd.arg("tar").arg("-czf").arg(tarball_path.to_str().unwrap()).arg("-C").arg(cwd.to_str().unwrap());
+        tar_args.iter().for_each(|arg| { cmd.arg(arg); });
+        cmd.output()
+    } else {
+        let mut cmd = Command::new("tar");
+        cmd.arg("-czf").arg(tarball_path.to_str().unwrap()).arg("-C").arg(cwd.to_str().unwrap());
+        tar_args.iter().for_each(|arg| { cmd.arg(arg); });
+        cmd.output()
+    }.wrap_err_with(|| format!("Failed to execute tar command for group {}", group_name))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eyre::bail!("Failed to archive group {}: {}", group_name, stderr);
+    }
+
+    Ok(())
+}
+
+fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Vec<Vec<PathBuf>>), std::io::Error> {
+    let mut directories = Vec::new();
+    let mut file_groups_map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let cwd_canonical = fs::canonicalize(cwd)?;
+
+    for target in targets {
+        let canonical_path = fs::canonicalize(target)?;
+        let relative_path = canonical_path.strip_prefix(&cwd_canonical)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Error calculating relative path"))?
+            .to_path_buf();
+
+        if canonical_path.is_dir() {
+            directories.push(relative_path);
+        } else if let Some(parent) = relative_path.parent() {
+            file_groups_map.entry(parent.to_path_buf())
+                .or_insert_with(Vec::new)
+                .push(relative_path);
+        }
+    }
+
+    let mut groups = Vec::new();
+    for (_, files) in file_groups_map.into_iter() {
+        groups.push(files);
+    }
+
+    Ok((directories, groups))
 }
 
 fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
@@ -169,12 +238,18 @@ fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove:
 
     create_metadata(&base, &cwd, targets)?;
 
-    let target_paths: Vec<_> = targets.iter()
-        .map(|target| archive_target(&base, target, sudo, &cwd))
-        .collect::<Result<Vec<_>, _>>()?;
+    let (directories, groups) = categorize_paths(targets, &cwd)?;
+
+    for directory in directories {
+        archive_directory(&base, &directory, sudo, &cwd)?;
+    }
+
+    for group in groups {
+        archive_group(&base, &group, sudo, &cwd)?;
+    }
 
     if remove {
-        remove_targets(&base, &target_paths)?;
+        remove_targets(&base, targets)?;
     }
 
     if let Some(days) = keep {
@@ -268,58 +343,6 @@ fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<()> {
     Ok(())
 }
 
-// given the following timestamp directory:
-// ~ via 🐍 v3.10.12 via 🦀 v1.76.0 on ☁️  (us-west-2) on ☁️
-// ❯ tree -a -I '.*|__*|tf|venv|target|incremental' /var/tmp/rmrf2/1708380459/
-// /var/tmp/rmrf2/1708380459/
-// ├── apple.tar.gz
-// ├── banana.tar.gz
-// └── metadata.yml
-//
-// The user can supply one of the following targets to recover:
-// /var/tmp/rmrf2/1708380459/   this will recover all of the files: apple.tar.gz, banana.tar.gz
-//
-// After the files have been successfully recovered, the program will remove the timestamp directory.
-//
-// The process should be the same, get the recovery path by getting the cwd value by loading the
-// metata.yml file. Then the untar should place the files relative to the cwd value.
-
-fn recover(dir: &Path, targets: &[PathBuf]) -> Result<()> {
-    let dir = dir.canonicalize().wrap_err("Failed to canonicalize rmrf path")?;
-    debug!("recover: dir={} targets={}", dir.display(), targets.iter().map(|t| t.to_string_lossy()).collect::<Vec<_>>().join(", "));
-
-    for target in targets {
-        debug!("target_path={}", target.display());
-
-        let target_path = if target.is_absolute() {
-            target.canonicalize().wrap_err("Failed to canonicalize target path")?
-        } else {
-            dir.join(target).canonicalize().wrap_err("Failed to canonicalize combined target path")?
-        };
-        debug!("canonical target_path={}", target_path.display());
-
-        if !target_path.starts_with(&dir) {
-            error!("Target path is not within the specified directory: {}", target_path.display());
-            continue;
-        }
-
-        let metadata_path = target_path.join("metadata.yml");
-        debug!("metadata_path={}", metadata_path.display());
-        let metadata: Metadata = serde_yaml::from_reader(File::open(&metadata_path).wrap_err("Failed to open metadata.yml")?)?;
-
-        let tarballs = find_tarballs(&target_path);
-        debug!("tarballs={:?}", tarballs);
-
-        for entry in tarballs {
-            extract_tarball(&entry.as_path(), &metadata.cwd)?;
-        }
-
-        fs::remove_dir_all(&target_path).wrap_err("Failed to remove the target directory after recovery")?;
-    }
-
-    Ok(())
-}
-
 fn find_tarballs(dir_path: &Path) -> Vec<PathBuf> {
     debug!("find_tarballs: dir_path={}", dir_path.display());
     let mut tarballs = Vec::new();
@@ -344,16 +367,56 @@ fn is_tar_gz(path: &Path) -> bool {
     }
 }
 
-fn extract_tarball(tarball_path: &Path, destination: &Path) -> Result<()> {
-    Command::new("tar")
+fn extract_tarball(tarball_path: &Path, restore_path: &Path) -> Result<()> {
+    debug!("Extracting {} to {}", tarball_path.display(), restore_path.display());
+
+    let output = Command::new("tar")
         .arg("-xzf")
         .arg(tarball_path)
         .arg("-C")
-        .arg(destination)
-        .status()
-        .wrap_err_with(|| format!("Failed to extract tarball: {}", tarball_path.display()))?;
+        .arg(restore_path)
+        .output()
+        .expect("Failed to execute tar command");
 
-    info!("Successfully recovered {}", tarball_path.display());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!("Tar extraction failed: {}", stderr));
+    }
+
+    Ok(())
+}
+
+// given the following timestamp directory:
+// ~ via 🐍 v3.10.12 via 🦀 v1.76.0 on ☁️  (us-west-2) on ☁️
+// ❯ tree -a -I '.*|__*|tf|venv|target|incremental' /var/tmp/rmrf2/1708380459/
+// /var/tmp/rmrf2/1708380459/
+// ├── apple.tar.gz
+// ├── banana.tar.gz
+// └── metadata.yml
+//
+// The user can supply one of the following targets to recover:
+// /var/tmp/rmrf2/1708380459/   this will recover all of the files: apple.tar.gz, banana.tar.gz
+//
+// After the files have been successfully recovered, the program will remove the timestamp directory.
+//
+// The process should be the same, get the recovery path by getting the cwd value by loading the
+// metata.yml file. Then the untar should place the files relative to the cwd value.
+fn recover(dir: &Path, targets: &[PathBuf]) -> Result<()> {
+    let dir = dir.canonicalize().wrap_err("Failed to canonicalize rmrf path")?;
+    debug!("recover: dir={} targets={}", dir.display(), targets.iter().map(|t| t.to_string_lossy()).collect::<Vec<_>>().join(", "));
+
+    for target in targets {
+        let metadata_path = target.join("metadata.yml");
+        let metadata: Metadata = serde_yaml::from_reader(File::open(&metadata_path).wrap_err("Failed to open metadata.yml")?)?;
+
+        let tarballs = find_tarballs(target);
+        for tarball in tarballs {
+            debug!("Recovering tarball: {}", tarball.display());
+            extract_tarball(&tarball, &metadata.cwd)?;
+        }
+    }
+    fs::remove_dir_all(dir).wrap_err("Failed to remove the directory after recovery")?;
+
     Ok(())
 }
 
