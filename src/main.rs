@@ -215,11 +215,13 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
 
     for target in targets {
         let canonical_path = fs::canonicalize(target)?;
-        let relative_path = canonical_path.strip_prefix(&cwd_canonical)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Error calculating relative path"))?
-            .to_path_buf();
+        let relative_path = match canonical_path.strip_prefix(&cwd_canonical) {
+            Ok(rel_path) => rel_path.to_path_buf(),
+            Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Error calculating relative path: {}", e))),
+        };
 
-        if canonical_path.is_dir() {
+        // Determine if the path is a directory or if its parent is directly `cwd`
+        if canonical_path.is_dir() || relative_path.parent().map_or(false, |p| p == Path::new("")) {
             directories.push(relative_path);
         } else if let Some(parent) = relative_path.parent() {
             file_groups_map.entry(parent.to_path_buf())
