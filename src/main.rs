@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::env;
 
 // Third-party crate imports
+use rayon::prelude::*;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::{Serialize, Deserialize};
@@ -136,7 +137,7 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn archive_directory(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> Result<PathBuf> {
+fn archive_directory(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> Result<()> {
     let target_path = cwd.join(target);
     let dir_name = target.file_name().ok_or_else(|| eyre!("Failed to extract directory/file name"))?;
     let tarball_name = format!("{}.tar.gz", dir_name.to_string_lossy());
@@ -164,7 +165,7 @@ fn archive_directory(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> R
         eyre::bail!("Failed to archive {}", target.to_string_lossy());
     }
 
-    Ok(target_path)
+    Ok(())
 }
 
 fn archive_group(base: &Path, group: &[PathBuf], sudo: bool, cwd: &Path) -> Result<()> {
@@ -240,13 +241,15 @@ fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove:
 
     let (directories, groups) = categorize_paths(targets, &cwd)?;
 
-    for directory in directories {
-        archive_directory(&base, &directory, sudo, &cwd)?;
-    }
+    // Process directories in parallel
+    directories.par_iter().try_for_each(|directory| {
+        archive_directory(&base, directory, sudo, &cwd)
+    })?;
 
-    for group in groups {
-        archive_group(&base, &group, sudo, &cwd)?;
-    }
+    // Process file groups in parallel
+    groups.par_iter().try_for_each(|group| {
+        archive_group(&base, group, sudo, &cwd)
+    })?;
 
     if remove {
         remove_targets(&base, targets)?;

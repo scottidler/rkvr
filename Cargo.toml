@@ -13,5 +13,6 @@ env_logger = "0.10.0"
 eyre = "0.6.8"
 fuzzy-matcher = "0.3.7"
 log = "0.4.20"
+rayon = "1.9.0"
 serde = { version = "1.0.196", features = ["derive"] }
 serde_yaml = "0.9.32"
