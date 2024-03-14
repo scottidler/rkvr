@@ -23,6 +23,10 @@ static EXA_ARGS: &[&str] = &[
     "--ignore-glob=venv", "--ignore-glob=target", "--ignore-glob=incremental",
 ];
 
+mod built_info {
+    include!(concat!(env!("OUT_DIR"), "/git_describe.rs"));
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct Metadata {
     cwd: PathBuf,
@@ -35,7 +39,7 @@ fn as_paths(paths: &[String]) -> Vec<PathBuf> {
 
 #[derive(Parser, Debug)]
 #[command(name = "rmrf", about = "tool for staging rmrf-ing or bkup-ing files")]
-#[command(version = "0.1.0")]
+#[command(version = built_info::GIT_DESCRIBE)]
 #[command(author = "Scott A. Idler <scott.a.idler@gmail.com>")]
 #[command(arg_required_else_help = true)]
 struct Cli {
@@ -101,8 +105,10 @@ fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
                     info!("Deleting path: {}", path.to_string_lossy());
 
                     if metadata.is_dir() {
+                        debug!("Removing directory: {}", path.to_string_lossy());
                         fs::remove_dir_all(&path)?;
                     } else {
+                        debug!("Removing file: {}", path.to_string_lossy());
                         fs::remove_file(&path)?;
                     }
                 }
@@ -142,9 +148,7 @@ fn archive_directory(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> R
     let dir_name = target.file_name().ok_or_else(|| eyre!("Failed to extract directory/file name"))?;
     let tarball_name = format!("{}.tar.gz", dir_name.to_string_lossy());
     let tarball_path = base.join(&tarball_name);
-
-    debug!("Archiving directory/file: {}", target_path.display());
-    debug!("Tarball will be saved as: {}", tarball_path.display());
+    debug!("archive_directory: target_path={} dir_name={} tarball_name={} tarball_path={}", target_path.display(), dir_name.to_string_lossy(), tarball_name, tarball_path.display());
 
     // The -C flag changes the working directory to `cwd` before starting the operation.
     // The `.` specifies to include the target directory/file relative to `cwd`.
@@ -241,12 +245,10 @@ fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove:
 
     let (directories, groups) = categorize_paths(targets, &cwd)?;
 
-    // Process directories in parallel
     directories.par_iter().try_for_each(|directory| {
         archive_directory(&base, directory, sudo, &cwd)
     })?;
 
-    // Process file groups in parallel
     groups.par_iter().try_for_each(|group| {
         archive_group(&base, group, sudo, &cwd)
     })?;
@@ -470,8 +472,6 @@ fn main() -> Result<()> {
         "Configuration - rmrf_path: {:?}, bkup_path: {:?}, sudo: {}, keep for days: {}, threshold: {}",
         rmrf_path, bkup_path, sudo, days, threshold,
     );
-
-    debug!("rmrf_path: {:?}, bkup_path: {:?}", rmrf_path, bkup_path);
 
     fs::create_dir_all(&rmrf_path)?;
     fs::create_dir_all(&bkup_path)?;
