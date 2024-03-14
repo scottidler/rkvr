@@ -2,7 +2,8 @@
 use log::{debug, info, warn, error};
 use std::fs::{self, File, DirEntry};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::{self, Write, BufWriter};
+use std::process::{Command, Stdio, ChildStdin, ExitStatus};
 use std::time::SystemTime;
 use std::collections::HashMap;
 use std::env;
@@ -15,6 +16,7 @@ use serde::{Serialize, Deserialize};
 use clap::{Parser, Subcommand};
 use configparser::ini::Ini;
 use eyre::{eyre, Context, Result};
+use atty::Stream;
 use dirs;
 
 static EXA_ARGS: &[&str] = &[
@@ -323,9 +325,46 @@ fn process_directory(matcher: &SkimMatcherV2, dir: &DirEntry, patterns: &[String
     Ok(true)
 }
 
+fn get_preferred_pager() -> String {
+    std::env::var("RMRF_PAGER")
+        .unwrap_or_else(|_| "less -RFX".to_string())
+}
+
+fn use_pager<F>(write_content: F) -> io::Result<()>
+where
+    F: FnOnce(&mut BufWriter<ChildStdin>) -> io::Result<()>,
+{
+    let pager_command = get_preferred_pager();
+    debug!("Using pager command: {}", pager_command);
+    let mut parts = pager_command.split_whitespace();
+    let pager = parts.next().unwrap_or("less");
+    let args = parts.collect::<Vec<&str>>();
+    debug!("Using pager: {} with args: {:?}", pager, args);
+
+    let mut pager_process = Command::new(pager)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .spawn()?;
+
+    if let Some(stdin) = pager_process.stdin.take() {
+        let mut writer = BufWriter::new(stdin);
+        if let Err(e) = write_content(&mut writer) {
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                warn!("Failed to write to pager: {}", e);
+                return Err(e);
+            }
+        }
+    }
+
+    let status: ExitStatus = pager_process.wait()?;
+    debug!("Pager exited with status: {:?}", status);
+    Ok(())
+}
+
 fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<()> {
     let matcher = SkimMatcherV2::default();
     let dir_path = fs::canonicalize(dir_path)?;
+    debug!("list: dir_path={} patterns={:?} threshold={}", dir_path.display(), patterns, threshold);
 
     let mut dirs: Vec<_> = fs::read_dir(&dir_path)?
         .filter_map(|entry| entry.ok())
@@ -334,17 +373,34 @@ fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<()> {
 
     dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
 
-    let mut any_matches = false;
+    debug!("dirs: {:?}", dirs);
 
-    for dir in &dirs {
-        if patterns.is_empty() || process_directory(&matcher, dir, &patterns, threshold)? {
-            print_directory(&dir.path());
-            any_matches = true;
+    if atty::is(Stream::Stdout) {
+        debug!("Using pager");
+        use_pager(|writer: &mut BufWriter<ChildStdin>| -> io::Result<()> {
+            for dir in &dirs {
+                if patterns.is_empty() || process_directory(&matcher, dir, &patterns, threshold)? {
+                    print_directory(&dir.path());
+                    writeln!(writer, "{}/", dir.path().display())?;
+                    if let Ok(metadata_content) = fs::read_to_string(dir.path().join("metadata.yml")) {
+                        writeln!(writer, "{}\n", metadata_content)?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+    } else {
+        debug!("Not using pager");
+        // Print directly to stdout if the output is being piped or redirected
+        for dir in &dirs {
+            if patterns.is_empty() || process_directory(&matcher, dir, &patterns, threshold)? {
+                print_directory(&dir.path());
+                println!("{}/", dir.path().display());
+                if let Ok(metadata_content) = fs::read_to_string(dir.path().join("metadata.yml")) {
+                    println!("{}\n", metadata_content);
+                }
+            }
         }
-    }
-
-    if !any_matches && !patterns.is_empty() {
-        warn!("No matches found for the given search term(s).");
     }
 
     Ok(())

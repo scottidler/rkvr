@@ -9,6 +9,7 @@ build = "build.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+atty = "0.2.14"
 clap = { version = "4.3.0", features = ["derive"] }
 configparser = "3.0.2"
 dirs = "3.0.2"
