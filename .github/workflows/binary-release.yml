@@ -67,7 +67,6 @@ jobs:
           path: rmrf-${{ github.ref_name }}-${{ matrix.suffix }}.*
 
   create-release:
-    permissions: write-all
     needs: build-and-package
     runs-on: ubuntu-latest
     steps:
@@ -79,8 +78,6 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            artifacts/rmrf-linux/*.tar.gz
-            artifacts/rmrf-macos/*.tar.gz
+          files: 'artifacts/**'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
