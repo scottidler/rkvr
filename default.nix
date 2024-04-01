@@ -3,7 +3,7 @@
 { stdenv, fetchurl, autoPatchelfHook, gcc, glibc, lib, libgcc, ... }:
 
 let
-  version = "0.3.15";
+  version = "0.1.8";
   owner = "scottidler";
   repo = "rmrf";
   suffix = "linux";
