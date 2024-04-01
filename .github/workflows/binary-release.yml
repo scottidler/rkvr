@@ -54,17 +54,17 @@ jobs:
       - name: Package binary
         run: |
           mkdir -p artifacts/
-          cp target/${{ matrix.target }}/release/aka artifacts/
+          cp target/${{ matrix.target }}/release/rmrf artifacts/
 
       - name: Archive artifacts
         run: |
-          tar -czvf aka-${{ github.ref_name }}-${{ matrix.suffix }}.tar.gz -C artifacts aka
+          tar -czvf rmrf-${{ github.ref_name }}-${{ matrix.suffix }}.tar.gz -C artifacts rmrf
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: aka-${{ matrix.suffix }}
-          path: aka-${{ github.ref_name }}-${{ matrix.suffix }}.*
+          name: rmrf-${{ matrix.suffix }}
+          path: rmrf-${{ github.ref_name }}-${{ matrix.suffix }}.*
 
   create-release:
     needs: build-and-package
