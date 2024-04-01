@@ -9,7 +9,7 @@ let
   suffix = "linux";
   tarball = fetchurl {
     url = "https://github.com/${owner}/${repo}/releases/download/v${version}/rmrf-v${version}-${suffix}.tar.gz";
-    sha256 = "082wk31b2ybs63rxib7ym54jly4ywwiyiz7shnxda18hl0ijsrxd";
+    sha256 = "0bx9r1npq47rvmddhv9405hmqiris18w2512fkyhgqpxs6nqm36j";
   };
 in stdenv.mkDerivation rec {
   pname = "rmrf";
