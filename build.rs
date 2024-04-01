@@ -1,39 +1,46 @@
+// build.rs
 use std::env;
-use std::fs::{read_to_string, write, File};
+use std::fs::{File, read_to_string};
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
 fn git_describe_value() -> String {
-    env::var("GIT_DESCRIBE").unwrap_or_else(|_| {
-        let output = Command::new("git")
-            .args(&["describe"])
-            .output()
-            .expect("Failed to execute `git describe`");
+    // First, check if GIT_DESCRIBE env var is set and use it if so
+    if let Ok(value) = env::var("GIT_DESCRIBE") {
+        return value;
+    }
 
-        String::from_utf8(output.stdout).expect("Not UTF-8").trim().to_string()
-    })
+    // Fallback to using git command
+    Command::new("git")
+        .args(&["describe", "--tags", "--always"])
+        .output()
+        .ok()
+        .and_then(|output| if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            None
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn main() {
-    let out_dir = env::var("OUT_DIR").unwrap();
-    let git_describe_path = Path::new(&out_dir).join("GIT_DESCRIBE");
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
+    let dest_path = Path::new(&out_dir).join("git_describe.rs");
+    let current_version = git_describe_value();
 
-    let old_value = read_to_string(&git_describe_path)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let new_value = git_describe_value();
-
-    if new_value != old_value {
-        println!("BUILD_RS: Version changed from '{}' to '{}'", old_value, new_value);
-        write(&git_describe_path, &new_value).unwrap();
-
-        let git_describe_rs = Path::new(&out_dir).join("git_describe.rs");
-        let mut f = File::create(&git_describe_rs).unwrap();
-        write!(f, "pub const GIT_DESCRIBE: &'static str = \"{}\";", new_value).unwrap();
+    // Compare with existing version, if any, to determine if we need to update
+    let old_version = read_to_string(&dest_path).unwrap_or_default();
+    if old_version.contains(&current_version) {
+        println!("Version unchanged, skipping update.");
+        return;
     }
 
+    let mut f = File::create(&dest_path).expect("Could not create file");
+    writeln!(f, "pub const GIT_DESCRIBE: &str = \"{}\";", current_version).expect("Could not write to file");
+
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-env-changed=GIT_DESCRIBE");
-    println!("cargo:rerun-if-changed={}", git_describe_path.display());
 }
+
