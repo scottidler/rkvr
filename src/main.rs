@@ -335,10 +335,14 @@ fn process_directory(matcher: &SkimMatcherV2, dir: &DirEntry, patterns: &[String
 }
 
 fn format_directory(dir_path: &Path) -> Result<String> {
-    let mut output = format!("{}/\n", dir_path.display());
+    let mut output = format!("{}/", dir_path.display());
     let metadata_path = dir_path.join("metadata.yml");
     if let Ok(metadata_content) = fs::read_to_string(&metadata_path) {
-        output += &format!("\n{}", metadata_content);
+        let indented_content: Vec<String> = metadata_content.lines()
+            .map(|line| format!("  {}", line))
+            .collect();
+        let indented_content_str = indented_content.join("\n");
+        output += &format!("\n{}\n", indented_content_str);
     }
     Ok(output)
 }
