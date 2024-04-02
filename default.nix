@@ -3,13 +3,13 @@
 { stdenv, fetchurl, autoPatchelfHook, gcc, glibc, lib, libgcc, ... }:
 
 let
-  version = "0.1.8";
+  version = "0.1.10";
   owner = "scottidler";
   repo = "rmrf";
   suffix = "linux";
   tarball = fetchurl {
     url = "https://github.com/${owner}/${repo}/releases/download/v${version}/rmrf-v${version}-${suffix}.tar.gz";
-    sha256 = "0bx9r1npq47rvmddhv9405hmqiris18w2512fkyhgqpxs6nqm36j";
+    sha256 = "11cm77rin3yia6axgixgrlp7pnpd9q98n6b22gam1328x1d9mkjq";
   };
 in stdenv.mkDerivation rec {
   pname = "rmrf";
