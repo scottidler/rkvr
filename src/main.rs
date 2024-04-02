@@ -1,9 +1,9 @@
 // Standard library imports
-use log::{debug, info, warn, error};
+use log::{debug, info};
 use std::fs::{self, File, DirEntry};
 use std::path::{Path, PathBuf};
 use std::io::{self, Write, BufWriter};
-use std::process::{Command, Stdio, ChildStdin, ExitStatus};
+use std::process::{Command, Stdio, ChildStdin};
 use std::time::SystemTime;
 use std::collections::HashMap;
 use std::env;
@@ -145,62 +145,53 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+fn create_tar_command(sudo: bool, tarball_path: &Path, cwd: &Path, targets: Vec<String>) -> Result<Command> {
+    let tarball_path = tarball_path.to_str().ok_or_else(|| eyre!("Invalid tarball path"))?;
+    let cwd = cwd.to_str().ok_or_else(|| eyre!("Invalid cwd path"))?;
+    if sudo {
+        let mut command = Command::new("sudo");
+        command.args(&["tar", "-czf", tarball_path, "-C", cwd]);
+        command.args(targets);
+        Ok(command)
+    } else {
+        let mut command = Command::new("tar");
+        command.args(&["-czf", tarball_path, "-C", cwd]);
+        command.args(targets);
+        Ok(command)
+    }
+}
+
 fn archive_directory(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> Result<()> {
-    let target_path = cwd.join(target);
     let dir_name = target.file_name().ok_or_else(|| eyre!("Failed to extract directory/file name"))?;
     let tarball_name = format!("{}.tar.gz", dir_name.to_string_lossy());
     let tarball_path = base.join(&tarball_name);
-    debug!("archive_directory: target_path={} dir_name={} tarball_name={} tarball_path={}", target_path.display(), dir_name.to_string_lossy(), tarball_name, tarball_path.display());
+    let targets = vec![target.to_string_lossy().into_owned()];
 
-    // The -C flag changes the working directory to `cwd` before starting the operation.
-    // The `.` specifies to include the target directory/file relative to `cwd`.
-    let output = if sudo {
-        Command::new("sudo")
-            .arg("tar")
-            .args(&["-czf", tarball_path.to_str().unwrap(), "-C", cwd.to_str().unwrap(), &format!("{}", target.to_string_lossy())])
-            .output()
-    } else {
-        Command::new("tar")
-            .args(&["-czf", tarball_path.to_str().unwrap(), "-C", cwd.to_str().unwrap(), &format!("{}", target.to_string_lossy())])
-            .output()
-    }.wrap_err_with(|| format!("Failed to execute tar command for {}", target_path.to_string_lossy()))?;
+    let mut command = create_tar_command(sudo, &tarball_path, cwd, targets)?;
+
+    let output = command.output()
+                        .wrap_err_with(|| format!("Failed to execute tar command for {}", target.to_string_lossy()))?;
 
     if !output.status.success() {
         let error_message = String::from_utf8_lossy(&output.stderr);
-        debug!("Tar command failed with error: {}", error_message);
-        eyre::bail!("Failed to archive {}", target.to_string_lossy());
+        eyre::bail!("Failed to archive {}: {}", target.to_string_lossy(), error_message);
     }
 
     Ok(())
 }
 
 fn archive_group(base: &Path, group: &[PathBuf], sudo: bool, cwd: &Path) -> Result<()> {
-    if group.is_empty() {
-        error!("An empty slice of files was passed to archive_group, indicating a critical error in the program logic.");
-        return Err(eyre!("An empty slice of files was passed to archive_group, indicating a critical error in the program logic."));
-    }
-
     let group_name = group.first().and_then(|path| path.parent()).and_then(|p| p.file_name())
         .ok_or_else(|| eyre!("Failed to derive group name"))?
         .to_string_lossy();
     let tarball_name = format!("{}.tar.gz", group_name);
     let tarball_path = base.join(&tarball_name);
+    let targets = group.iter().map(|path| path.to_string_lossy().into_owned()).collect();
 
-    // The `-C` option changes the working directory before starting the operation
-    // Here, it's changed to `cwd` and then paths are added relative to this directory
-    let tar_args: Vec<String> = group.iter().map(|path| path.to_string_lossy().into_owned()).collect();
+    let mut command = create_tar_command(sudo, &tarball_path, cwd, targets)?;
 
-    let output = if sudo {
-        let mut cmd = Command::new("sudo");
-        cmd.arg("tar").arg("-czf").arg(tarball_path.to_str().unwrap()).arg("-C").arg(cwd.to_str().unwrap());
-        tar_args.iter().for_each(|arg| { cmd.arg(arg); });
-        cmd.output()
-    } else {
-        let mut cmd = Command::new("tar");
-        cmd.arg("-czf").arg(tarball_path.to_str().unwrap()).arg("-C").arg(cwd.to_str().unwrap());
-        tar_args.iter().for_each(|arg| { cmd.arg(arg); });
-        cmd.output()
-    }.wrap_err_with(|| format!("Failed to execute tar command for group {}", group_name))?;
+    let output = command.output()
+                        .wrap_err_with(|| format!("Failed to execute tar command for group {}", group_name))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -281,14 +272,35 @@ fn remove_targets(base: &Path, targets: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn print_directory(dir_path: &Path) {
-    println!("{}/", dir_path.display());
-    if let Ok(metadata_content) = fs::read_to_string(dir_path.join("metadata.yml")) {
-        println!("{}", metadata_content);
-    }
+fn get_preferred_pager() -> String {
+    std::env::var("RMRF_PAGER")
+        .unwrap_or_else(|_| "less -RFX".to_string())
 }
 
-fn process_pattern(matcher: &SkimMatcherV2, dir_name: &str, full_path: &PathBuf, pattern: &str, threshold: i64) -> Result<bool, std::io::Error> {
+fn use_pager<F>(write_content: F) -> Result<()>
+where
+    F: FnOnce(&mut BufWriter<ChildStdin>) -> Result<()>,
+{
+    let pager_command = get_preferred_pager();
+    let mut parts = pager_command.split_whitespace();
+    let pager = parts.next().unwrap_or("less");
+    let args = parts.collect::<Vec<&str>>();
+
+    let mut pager_process = Command::new(pager)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .spawn()?;
+
+    if let Some(stdin) = pager_process.stdin.take() {
+        let mut writer = BufWriter::new(stdin);
+        write_content(&mut writer)?;
+    }
+
+    let _status = pager_process.wait()?;
+    Ok(())
+}
+
+fn process_pattern(matcher: &SkimMatcherV2, dir_name: &str, full_path: &PathBuf, pattern: &str, threshold: i64) -> Result<bool> {
     if matcher.fuzzy_match(dir_name, pattern).is_some() ||
        matcher.fuzzy_match(full_path.to_str().unwrap_or_default(), pattern).is_some() {
         return Ok(true);
@@ -296,7 +308,7 @@ fn process_pattern(matcher: &SkimMatcherV2, dir_name: &str, full_path: &PathBuf,
 
     let metadata_path = full_path.join("metadata.yml");
     if metadata_path.exists() {
-        let metadata_content = fs::read_to_string(&metadata_path)?;
+        let metadata_content = std::fs::read_to_string(&metadata_path)?;
         for line in metadata_content.lines() {
             if let Some(score) = matcher.fuzzy_match(line, pattern) {
                 if score > threshold {
@@ -309,96 +321,55 @@ fn process_pattern(matcher: &SkimMatcherV2, dir_name: &str, full_path: &PathBuf,
     Ok(false)
 }
 
-fn process_directory(matcher: &SkimMatcherV2, dir: &DirEntry, patterns: &[String], threshold: i64) -> Result<bool, std::io::Error> {
+fn process_directory(matcher: &SkimMatcherV2, dir: &DirEntry, patterns: &[String], threshold: i64) -> Result<bool> {
     let dir_name = dir.file_name().to_string_lossy().to_string();
-    let full_path = dir.path().canonicalize()?;
+    let full_path = dir.path().canonicalize().wrap_err("Failed to canonicalize directory path")?;
 
-    if !patterns.is_empty() {
-        for pattern in patterns {
-            if process_pattern(matcher, &dir_name, &full_path, pattern, threshold)? {
-                return Ok(true);
-            }
-        }
-        return Ok(false);
-    }
-
-    Ok(true)
-}
-
-fn get_preferred_pager() -> String {
-    std::env::var("RMRF_PAGER")
-        .unwrap_or_else(|_| "less -RFX".to_string())
-}
-
-fn use_pager<F>(write_content: F) -> io::Result<()>
-where
-    F: FnOnce(&mut BufWriter<ChildStdin>) -> io::Result<()>,
-{
-    let pager_command = get_preferred_pager();
-    debug!("Using pager command: {}", pager_command);
-    let mut parts = pager_command.split_whitespace();
-    let pager = parts.next().unwrap_or("less");
-    let args = parts.collect::<Vec<&str>>();
-    debug!("Using pager: {} with args: {:?}", pager, args);
-
-    let mut pager_process = Command::new(pager)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .spawn()?;
-
-    if let Some(stdin) = pager_process.stdin.take() {
-        let mut writer = BufWriter::new(stdin);
-        if let Err(e) = write_content(&mut writer) {
-            if e.kind() != io::ErrorKind::BrokenPipe {
-                warn!("Failed to write to pager: {}", e);
-                return Err(e);
-            }
+    for pattern in patterns {
+        if process_pattern(matcher, &dir_name, &full_path, pattern, threshold)? {
+            return Ok(true);
         }
     }
 
-    let status: ExitStatus = pager_process.wait()?;
-    debug!("Pager exited with status: {:?}", status);
-    Ok(())
+    Ok(patterns.is_empty())
+}
+
+fn format_directory(dir_path: &Path) -> Result<String> {
+    let mut output = format!("{}/\n", dir_path.display());
+    let metadata_path = dir_path.join("metadata.yml");
+    if let Ok(metadata_content) = fs::read_to_string(&metadata_path) {
+        output += &format!("\n{}", metadata_content);
+    }
+    Ok(output)
 }
 
 fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<()> {
     let matcher = SkimMatcherV2::default();
-    let dir_path = fs::canonicalize(dir_path)?;
-    debug!("list: dir_path={} patterns={:?} threshold={}", dir_path.display(), patterns, threshold);
+    let dir_path = fs::canonicalize(dir_path).wrap_err("Failed to canonicalize directory path")?;
 
     let mut dirs: Vec<_> = fs::read_dir(&dir_path)?
-        .filter_map(|entry| entry.ok())
+        .filter_map(Result::ok)
         .filter(|entry| entry.path().is_dir())
         .collect();
 
     dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
 
-    debug!("dirs: {:?}", dirs);
-
     if atty::is(Stream::Stdout) {
-        debug!("Using pager");
-        use_pager(|writer: &mut BufWriter<ChildStdin>| -> io::Result<()> {
-            for dir in &dirs {
-                if patterns.is_empty() || process_directory(&matcher, dir, &patterns, threshold)? {
-                    print_directory(&dir.path());
-                    writeln!(writer, "{}/", dir.path().display())?;
-                    if let Ok(metadata_content) = fs::read_to_string(dir.path().join("metadata.yml")) {
-                        writeln!(writer, "{}\n", metadata_content)?;
-                    }
+        use_pager(|writer: &mut BufWriter<ChildStdin>| -> Result<()> {
+            for dir in dirs.iter() {
+                if patterns.is_empty() || process_directory(&matcher, dir, &patterns, threshold).map_err(|e| io::Error::new(io::ErrorKind::Other, e))? {
+                    let dir_output = format_directory(&dir.path()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    writer.write_all(dir_output.as_bytes())?;
+                    writer.write_all(b"\n")?;
                 }
             }
             Ok(())
         })?;
     } else {
-        debug!("Not using pager");
-        // Print directly to stdout if the output is being piped or redirected
-        for dir in &dirs {
+        for dir in dirs.iter() {
             if patterns.is_empty() || process_directory(&matcher, dir, &patterns, threshold)? {
-                print_directory(&dir.path());
-                println!("{}/", dir.path().display());
-                if let Ok(metadata_content) = fs::read_to_string(dir.path().join("metadata.yml")) {
-                    println!("{}\n", metadata_content);
-                }
+                let dir_output = format_directory(&dir.path())?;
+                println!("{}", dir_output);
             }
         }
     }
