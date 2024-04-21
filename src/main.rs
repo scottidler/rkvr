@@ -165,16 +165,16 @@ fn archive_directory(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> R
     let dir_name = target.file_name().ok_or_else(|| eyre!("Failed to extract directory/file name"))?;
     let tarball_name = format!("{}.tar.gz", dir_name.to_string_lossy());
     let tarball_path = base.join(&tarball_name);
-    let targets = vec![target.to_string_lossy().into_owned()];
+    let targets = vec![target.as_path().display().to_string()];
 
     let mut command = create_tar_command(sudo, &tarball_path, cwd, targets)?;
 
     let output = command.output()
-                        .wrap_err_with(|| format!("Failed to execute tar command for {}", target.to_string_lossy()))?;
+                        .wrap_err_with(|| format!("Failed to execute tar command for {}", target.display()))?;
 
     if !output.status.success() {
         let error_message = String::from_utf8_lossy(&output.stderr);
-        eyre::bail!("Failed to archive {}: {}", target.to_string_lossy(), error_message);
+        eyre::bail!("Failed to archive {}: {}", target.display(), error_message);
     }
 
     Ok(())
@@ -201,7 +201,7 @@ fn archive_group(base: &Path, group: &[PathBuf], sudo: bool, cwd: &Path) -> Resu
     Ok(())
 }
 
-fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Vec<Vec<PathBuf>>), std::io::Error> {
+fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Vec<Vec<PathBuf>>)> {
     let mut directories = Vec::new();
     let mut file_groups_map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
     let cwd_canonical = fs::canonicalize(cwd)?;
@@ -210,16 +210,18 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
         let canonical_path = fs::canonicalize(target)?;
         let relative_path = match canonical_path.strip_prefix(&cwd_canonical) {
             Ok(rel_path) => rel_path.to_path_buf(),
-            Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Error calculating relative path: {}", e))),
+            Err(_) => canonical_path.clone(),
         };
 
-        // Determine if the path is a directory or if its parent is directly `cwd`
-        if canonical_path.is_dir() || relative_path.parent().map_or(false, |p| p == Path::new("")) {
-            directories.push(relative_path);
-        } else if let Some(parent) = relative_path.parent() {
-            file_groups_map.entry(parent.to_path_buf())
+        if canonical_path.is_dir() {
+            directories.push(canonical_path);
+        } else {
+            let group_key = relative_path.parent()
+                .map(|p| cwd_canonical.join(p))
+                .unwrap_or_else(|| canonical_path.parent().unwrap().to_path_buf());
+            file_groups_map.entry(group_key)
                 .or_insert_with(Vec::new)
-                .push(relative_path);
+                .push(canonical_path);
         }
     }
 
