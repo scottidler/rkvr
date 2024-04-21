@@ -210,7 +210,10 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
         let canonical_path = fs::canonicalize(target)?;
         let relative_path = match canonical_path.strip_prefix(&cwd_canonical) {
             Ok(rel_path) => rel_path.to_path_buf(),
-            Err(_) => canonical_path.clone(),
+            Err(e) => {
+                debug!("Unable to strip prefix from path '{}': {}", canonical_path.display(), e);
+                canonical_path.clone()
+            },
         };
 
         if canonical_path.is_dir() {
