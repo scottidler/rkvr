@@ -204,10 +204,13 @@ fn archive_group(base: &Path, group: &[PathBuf], sudo: bool, cwd: &Path) -> Resu
 fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Vec<Vec<PathBuf>>)> {
     let mut directories = Vec::new();
     let mut file_groups_map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-    let cwd_canonical = fs::canonicalize(cwd)?;
+    let cwd_canonical = fs::canonicalize(cwd).wrap_err("Failed to canonicalize cwd")?;
+    debug!("Canonicalized cwd: {}", cwd_canonical.display());
 
     for target in targets {
-        let canonical_path = fs::canonicalize(target)?;
+        let canonical_path = fs::canonicalize(target).wrap_err("Failed to canonicalize target")?;
+        debug!("Canonicalized target: {}", canonical_path.display());
+
         let relative_path = match canonical_path.strip_prefix(&cwd_canonical) {
             Ok(rel_path) => rel_path.to_path_buf(),
             Err(e) => {
@@ -215,6 +218,7 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
                 canonical_path.clone()
             },
         };
+        debug!("Relative path: {}", relative_path.display());
 
         if canonical_path.is_dir() {
             directories.push(canonical_path);
