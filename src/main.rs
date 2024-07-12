@@ -435,14 +435,14 @@ fn extract_tarball(tarball_path: &Path, restore_path: &Path) -> Result<()> {
 
 // given the following timestamp directory:
 // ~ via 🐍 v3.10.12 via 🦀 v1.76.0 on ☁️  (us-west-2) on ☁️
-// ❯ tree -a -I '.*|__*|tf|venv|target|incremental' /var/tmp/rmrf2/1708380459/
-// /var/tmp/rmrf2/1708380459/
+// ❯ tree -a -I '.*|__*|tf|venv|target|incremental' /var/tmp/rmrf/1708380459/
+// /var/tmp/rmrf/1708380459/
 // ├── apple.tar.gz
 // ├── banana.tar.gz
 // └── metadata.yml
 //
 // The user can supply one of the following targets to recover:
-// /var/tmp/rmrf2/1708380459/   this will recover all of the files: apple.tar.gz, banana.tar.gz
+// /var/tmp/rmrf/1708380459/   this will recover all of the files: apple.tar.gz, banana.tar.gz
 //
 // After the files have been successfully recovered, the program will remove the timestamp directory.
 //
@@ -486,7 +486,7 @@ fn main() -> Result<()> {
 
     let rmrf_cfg_path = dirs::home_dir()
         .ok_or(eyre!("home dir not found!"))?
-        .join(".config/rmrf/rmrf2.cfg");
+        .join(".config/rmrf/rmrf.cfg");
     debug!("Configuration file path: {:?}", rmrf_cfg_path);
 
     let mut rmrf_cfg = Ini::new();
