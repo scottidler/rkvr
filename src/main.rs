@@ -262,7 +262,7 @@ fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove:
     }
 
     if let Some(days) = keep {
-        cleanup(&base, days as usize)?;
+        cleanup(&path, days as usize)?;
     }
 
     Ok(())
