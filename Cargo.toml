@@ -1,5 +1,5 @@
 [package]
-name = "rmrf"
+name = "rkvr"
 version = "0.1.0"
 authors = ["Scott Idler <scott.a.idler@gmail.com>"]
 edition = "2021"

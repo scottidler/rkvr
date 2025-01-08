@@ -40,7 +40,7 @@ fn as_paths(paths: &[String]) -> Vec<PathBuf> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "rmrf", about = "tool for staging rmrf-ing or bkup-ing files")]
+#[command(name = "rkvr", about = "tool for staging rmrf-ing or bkup-ing files")]
 #[command(version = built_info::GIT_DESCRIBE)]
 #[command(author = "Scott A. Idler <scott.a.idler@gmail.com>")]
 #[command(arg_required_else_help = true)]
