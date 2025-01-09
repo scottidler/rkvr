@@ -10,13 +10,13 @@ build = "build.rs"
 
 [dependencies]
 atty = "0.2.14"
-clap = { version = "4.3.0", features = ["derive"] }
-configparser = "3.0.2"
+clap = { version = "4.5.24", features = ["derive"] }
+configparser = "3.1.0"
 dirs = "3.0.2"
-env_logger = "0.10.0"
-eyre = "0.6.8"
+env_logger = "0.10.2"
+eyre = "0.6.12"
 fuzzy-matcher = "0.3.7"
-log = "0.4.20"
-rayon = "1.9.0"
-serde = { version = "1.0.196", features = ["derive"] }
-serde_yaml = "0.9.32"
+log = "0.4.22"
+rayon = "1.10.0"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_yaml = "0.9.34"
