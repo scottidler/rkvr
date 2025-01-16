@@ -302,7 +302,11 @@ where
 
     if let Some(stdin) = pager_process.stdin.take() {
         let mut writer = BufWriter::new(stdin);
-        write_content(&mut writer)?;
+        if let Err(e) = write_content(&mut writer) {
+            if e.downcast_ref::<io::Error>().map_or(true, |io_err| io_err.kind() != io::ErrorKind::BrokenPipe) {
+                return Err(e);
+            }
+        }
     }
 
     let _status = pager_process.wait()?;
