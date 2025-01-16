@@ -1,4 +1,4 @@
-// Standard library imports
+// src/main.rs
 use log::{debug, info};
 use std::fs::{self, File, DirEntry};
 use std::path::{Path, PathBuf};
