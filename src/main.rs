@@ -33,6 +33,8 @@ mod built_info {
 struct Metadata {
     cwd: PathBuf,
     contents: String,
+    archives: Vec<String>,
+    binaries: Vec<String>,
 }
 
 fn as_paths(paths: &[String]) -> Vec<PathBuf> {
@@ -137,6 +139,8 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
     let metadata = Metadata {
         cwd: cwd.to_path_buf(),
         contents: metadata_content.to_string(),
+        archives: vec![],
+        binaries: vec![],
     };
 
     let yaml_metadata = serde_yaml::to_string(&metadata).wrap_err("Failed to serialize metadata to YAML")?;
