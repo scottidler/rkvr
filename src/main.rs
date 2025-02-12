@@ -19,7 +19,7 @@ use eyre::{eyre, Context, Result};
 use atty::Stream;
 use dirs;
 
-static EXA_ARGS: &[&str] = &[
+static EZA_ARGS: &[&str] = &[
     "--tree", "--long", "-a",
     "--ignore-glob=.*", "--ignore-glob=__*", "--ignore-glob=tf",
     "--ignore-glob=venv", "--ignore-glob=target", "--ignore-glob=incremental",
@@ -125,11 +125,11 @@ fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
 fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
     info!("fn create_metadata: base={} cwd={} targets={:?}", base.display(), cwd.display(), targets);
 
-    let output = Command::new("exa")
-        .args(EXA_ARGS)
+    let output = Command::new("eza")
+        .args(EZA_ARGS)
         .args(targets.iter().map(|t| t.to_str().unwrap()))
         .output()
-        .wrap_err("Failed to execute exa command")?;
+        .wrap_err("Failed to execute eza command")?;
 
     let metadata_content = String::from_utf8_lossy(&output.stdout);
     debug!("Metadata content: {}", metadata_content);
