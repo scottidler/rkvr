@@ -136,11 +136,13 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
     let metadata_content = String::from_utf8_lossy(&output.stdout);
     debug!("Metadata content: {}", metadata_content);
 
+    let (_, _, binaries) = categorize_paths(targets, cwd)?;
+
     let metadata = Metadata {
         cwd: cwd.to_path_buf(),
         contents: metadata_content.to_string(),
         archives: vec![],
-        binaries: vec![],
+        binaries: binaries.iter().map(|b| b.display().to_string()).collect(),
     };
 
     let yaml_metadata = serde_yaml::to_string(&metadata).wrap_err("Failed to serialize metadata to YAML")?;
@@ -148,6 +150,7 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
     fs::write(&metadata_path, yaml_metadata.as_bytes()).wrap_err("Failed to write metadata file")?;
     Ok(())
 }
+
 
 fn create_tar_command(sudo: bool, tarball_path: &Path, cwd: &Path, targets: Vec<String>) -> Result<Command> {
     let tarball_path = tarball_path.to_str().ok_or_else(|| eyre!("Invalid tarball path"))?;
@@ -164,7 +167,7 @@ fn create_tar_command(sudo: bool, tarball_path: &Path, cwd: &Path, targets: Vec<
         Ok(command)
     }
 }
-
+/*
 fn archive_directory(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> Result<()> {
     let dir_name = target.file_name().ok_or_else(|| eyre!("Failed to extract directory/file name"))?;
     let tarball_name = format!("{}.tar.gz", dir_name.to_string_lossy());
@@ -204,7 +207,64 @@ fn archive_group(base: &Path, group: &[PathBuf], sudo: bool, cwd: &Path) -> Resu
 
     Ok(())
 }
+*/
 
+fn archive_directory(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> Result<()> {
+    let dir_entries: Vec<PathBuf> = fs::read_dir(target)?.filter_map(|entry| entry.ok().map(|e| e.path())).collect();
+    let non_binaries: Vec<_> = dir_entries.into_iter().filter(|p| !is_binary(p)).collect();
+
+    if non_binaries.is_empty() {
+        debug!("Skipping directory {} as it contains only binaries or is empty.", target.display());
+        return Ok(());
+    }
+
+    let dir_name = target.file_name().ok_or_else(|| eyre!("Failed to extract directory/file name"))?;
+    let tarball_name = format!("{}.tar.gz", dir_name.to_string_lossy());
+    let tarball_path = base.join(&tarball_name);
+
+    let targets = non_binaries.into_iter().map(|p| p.to_string_lossy().to_string()).collect();
+    let mut command = create_tar_command(sudo, &tarball_path, cwd, targets)?;
+
+    let output = command.output()
+                        .wrap_err_with(|| format!("Failed to execute tar command for {}", target.display()))?;
+
+    if !output.status.success() {
+        let error_message = String::from_utf8_lossy(&output.stderr);
+        eyre::bail!("Failed to archive {}: {}", target.display(), error_message);
+    }
+
+    Ok(())
+}
+
+fn archive_group(base: &Path, group: &[PathBuf], sudo: bool, cwd: &Path) -> Result<()> {
+    let filtered_group: Vec<_> = group.iter().filter(|path| !is_binary(path)).collect();
+
+    if filtered_group.is_empty() {
+        debug!("Skipping group as it contains only binaries.");
+        return Ok(());
+    }
+
+    let group_name = group.first().and_then(|path| path.parent()).and_then(|p| p.file_name())
+        .ok_or_else(|| eyre!("Failed to derive group name"))?
+        .to_string_lossy();
+    let tarball_name = format!("{}.tar.gz", group_name);
+    let tarball_path = base.join(&tarball_name);
+
+    let targets = filtered_group.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    let mut command = create_tar_command(sudo, &tarball_path, cwd, targets)?;
+
+    let output = command.output()
+                        .wrap_err_with(|| format!("Failed to execute tar command for group {}", group_name))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eyre::bail!("Failed to archive group {}: {}", group_name, stderr);
+    }
+
+    Ok(())
+}
+
+/*
 fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Vec<Vec<PathBuf>>)> {
     let mut directories = Vec::new();
     let mut file_groups_map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
@@ -243,7 +303,58 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
 
     Ok((directories, groups))
 }
+*/
 
+fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Vec<Vec<PathBuf>>, Vec<PathBuf>)> {
+    let mut directories = Vec::new();
+    let mut file_groups_map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut binaries = Vec::new();
+
+    let cwd_canonical = fs::canonicalize(cwd).wrap_err("Failed to canonicalize cwd")?;
+    debug!("Canonicalized cwd: {}", cwd_canonical.display());
+
+    for target in targets {
+        let canonical_path = fs::canonicalize(target).wrap_err("Failed to canonicalize target")?;
+        debug!("Canonicalized target: {}", canonical_path.display());
+
+        let relative_path = match canonical_path.strip_prefix(&cwd_canonical) {
+            Ok(rel_path) => rel_path.to_path_buf(),
+            Err(e) => {
+                debug!("Unable to strip prefix from path '{}': {}", canonical_path.display(), e);
+                canonical_path.clone()
+            },
+        };
+        debug!("Relative path: {}", relative_path.display());
+
+        if canonical_path.is_dir() {
+            directories.push(canonical_path);
+        } else if is_binary(&canonical_path) {
+            binaries.push(relative_path);
+        } else {
+            let group_key = relative_path.parent()
+                .map(|p| cwd_canonical.join(p))
+                .unwrap_or_else(|| canonical_path.parent().unwrap().to_path_buf());
+            file_groups_map.entry(group_key)
+                .or_insert_with(Vec::new)
+                .push(canonical_path);
+        }
+    }
+
+    let mut groups = Vec::new();
+    for (_, files) in file_groups_map.into_iter() {
+        groups.push(files);
+    }
+
+    Ok((directories, groups, binaries))
+}
+
+fn is_binary(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("tar") | Some("tar.gz") | Some("zip") | Some("mp3") | Some("mp4") => true,
+        _ => false,
+    }
+}
+/*
 fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
     let cwd = env::current_dir().wrap_err("Failed to get current directory")?;
     let base = path.join(timestamp.to_string());
@@ -252,6 +363,44 @@ fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove:
     create_metadata(&base, &cwd, targets)?;
 
     let (directories, groups) = categorize_paths(targets, &cwd)?;
+
+    directories.par_iter().try_for_each(|directory| {
+        archive_directory(&base, directory, sudo, &cwd)
+    })?;
+
+    groups.par_iter().try_for_each(|group| {
+        archive_group(&base, group, sudo, &cwd)
+    })?;
+
+    if remove {
+        remove_targets(&base, targets)?;
+    }
+
+    if let Some(days) = keep {
+        cleanup(&path, days as usize)?;
+    }
+
+    Ok(())
+}
+*/
+
+fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
+    let cwd = env::current_dir().wrap_err("Failed to get current directory")?;
+    let base = path.join(timestamp.to_string());
+    fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
+
+    create_metadata(&base, &cwd, targets)?;
+
+    let (directories, groups, binaries) = categorize_paths(targets, &cwd)?;
+
+    for binary in binaries {
+        debug!("Skipping binary: {}", binary.display());
+    }
+
+    if directories.is_empty() && groups.is_empty() {
+        debug!("No valid directories or files to archive.");
+        return Ok(());
+    }
 
     directories.par_iter().try_for_each(|directory| {
         archive_directory(&base, directory, sudo, &cwd)
