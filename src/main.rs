@@ -81,10 +81,20 @@ impl Default for Action {
 }
 
 fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
-    info!("fn cleanup: dir_path={} days={}", dir_path.to_string_lossy(), days);
+    info!(
+        "fn cleanup: dir_path={} days={}",
+        dir_path.to_string_lossy(),
+        days
+    );
 
     let now = SystemTime::now();
     debug!("Current time: {:?}", now);
+
+    let delete_threshold = std::time::Duration::from_secs(60 * 60 * 24 * days as u64);
+    debug!(
+        "Delete threshold duration: {:?} ({} days)",
+        delete_threshold, days
+    );
 
     let entries = fs::read_dir(dir_path)?;
     debug!("Directory entries read: entries={:?}", entries);
@@ -101,9 +111,12 @@ fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
             debug!("Modified time: {:?}", modified_time);
 
             if let Ok(duration_since_modified) = now.duration_since(modified_time) {
-                debug!("Duration since modified: {:?}", duration_since_modified);
+                debug!(
+                    "Duration since modified: {:?}, Delete threshold: {:?}",
+                    duration_since_modified, delete_threshold
+                );
 
-                if duration_since_modified > std::time::Duration::from_secs(60 * 60 * 24 * days as u64) {
+                if duration_since_modified > delete_threshold {
                     info!("Deleting path: {}", path.to_string_lossy());
 
                     if metadata.is_dir() {
@@ -148,15 +161,21 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
 fn create_tar_command(sudo: bool, tarball_path: &Path, cwd: &Path, targets: Vec<String>) -> Result<Command> {
     let tarball_path = tarball_path.to_str().ok_or_else(|| eyre!("Invalid tarball path"))?;
     let cwd = cwd.to_str().ok_or_else(|| eyre!("Invalid cwd path"))?;
+
+    let relative_targets: Vec<String> = targets
+        .iter()
+        .map(|t| Path::new(t).strip_prefix(cwd).unwrap_or(Path::new(t)).to_string_lossy().to_string())
+        .collect();
+
     if sudo {
         let mut command = Command::new("sudo");
         command.args(&["tar", "-czf", tarball_path, "-C", cwd]);
-        command.args(targets);
+        command.args(&relative_targets);
         Ok(command)
     } else {
         let mut command = Command::new("tar");
         command.args(&["-czf", tarball_path, "-C", cwd]);
-        command.args(targets);
+        command.args(&relative_targets);
         Ok(command)
     }
 }
@@ -208,7 +227,8 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
     debug!("Canonicalized cwd: {}", cwd_canonical.display());
 
     for target in targets {
-        let canonical_path = fs::canonicalize(target).wrap_err("Failed to canonicalize target")?;
+        let canonical_path = fs::canonicalize(target)
+            .wrap_err_with(|| format!("Failed to canonicalize target: {}", target.display()))?;
         debug!("Canonicalized target: {}", canonical_path.display());
 
         let relative_path = match canonical_path.strip_prefix(&cwd_canonical) {
