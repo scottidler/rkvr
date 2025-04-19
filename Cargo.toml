@@ -1,6 +1,6 @@
 [package]
 name = "rkvr"
-version = "0.1.15"
+version = "0.1.16"
 authors = ["Scott Idler <scott.a.idler@gmail.com>"]
 edition = "2021"
 build = "build.rs"
