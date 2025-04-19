@@ -6,6 +6,8 @@ use std::io::{self, Write, BufWriter};
 use std::process::{Command, Stdio, ChildStdin};
 use std::time::SystemTime;
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
+use libc::getuid;
 use std::env;
 
 // Third-party crate imports
@@ -33,6 +35,8 @@ mod built_info {
 struct Metadata {
     cwd: PathBuf,
     contents: String,
+    #[serde(default)]
+    targets: Vec<String>,
 }
 
 fn as_paths(paths: &[String]) -> Vec<PathBuf> {
@@ -80,6 +84,14 @@ impl Default for Action {
     }
 }
 
+fn current_uid() -> u32 {
+    // unsafe call into libc
+    unsafe { getuid() as u32 }
+}
+
+fn file_uid(path: &Path) -> eyre::Result<u32> {
+    Ok(fs::metadata(path)?.uid())
+}
 fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
     info!(
         "fn cleanup: dir_path={} days={}",
@@ -147,9 +159,19 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
     let metadata_content = String::from_utf8_lossy(&output.stdout);
     debug!("Metadata content: {}", metadata_content);
 
+   let target_names: Vec<String> = targets
+       .iter()
+       .map(|p| {
+           p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string())
+       })
+       .collect();
+
     let metadata = Metadata {
         cwd: cwd.to_path_buf(),
         contents: metadata_content.to_string(),
+        targets: target_names,
     };
 
     let yaml_metadata = serde_yaml::to_string(&metadata).wrap_err("Failed to serialize metadata to YAML")?;
@@ -158,63 +180,183 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn create_tar_command(sudo: bool, tarball_path: &Path, cwd: &Path, targets: Vec<String>) -> Result<Command> {
-    let tarball_path = tarball_path.to_str().ok_or_else(|| eyre!("Invalid tarball path"))?;
-    let cwd = cwd.to_str().ok_or_else(|| eyre!("Invalid cwd path"))?;
-
+fn create_tar_command(
+    sudo: bool,
+    tarball_path: &Path,
+    cwd: &Path,
+    targets: Vec<String>,
+) -> Result<Command> {
     let relative_targets: Vec<String> = targets
-        .iter()
-        .map(|t| Path::new(t).strip_prefix(cwd).unwrap_or(Path::new(t)).to_string_lossy().to_string())
+        .into_iter()
+        .map(|t| {
+            Path::new(&t)
+                .strip_prefix(cwd)
+                .unwrap_or(Path::new(&t))
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
 
     if sudo {
-        let mut command = Command::new("sudo");
-        command.args(&["tar", "-czf", tarball_path, "-C", cwd]);
-        command.args(&relative_targets);
-        Ok(command)
+        let mut cmd = Command::new("sudo");
+        cmd.args(&["tar", "-czf", tarball_path.to_str().unwrap(), "-C", cwd.to_str().unwrap()]);
+        cmd.args(&relative_targets);
+        Ok(cmd)
     } else {
-        let mut command = Command::new("tar");
-        command.args(&["-czf", tarball_path, "-C", cwd]);
-        command.args(&relative_targets);
-        Ok(command)
+        let mut cmd = Command::new("tar");
+        cmd.args(&["-czf", tarball_path.to_str().unwrap(), "-C", cwd.to_str().unwrap()]);
+        cmd.args(&relative_targets);
+        Ok(cmd)
     }
 }
 
-fn archive_directory(base: &Path, target: &PathBuf, sudo: bool, cwd: &Path) -> Result<()> {
-    let dir_name = target.file_name().ok_or_else(|| eyre!("Failed to extract directory/file name"))?;
-    let tarball_name = format!("{}.tar.gz", dir_name.to_string_lossy());
-    let tarball_path = base.join(&tarball_name);
-    let targets = vec![target.as_path().display().to_string()];
+fn archive_directory(
+    base: &Path,
+    target: &PathBuf,
+    sudo: bool,
+    cwd: &Path,
+) -> Result<()> {
+    let owner = fs::metadata(target)?.uid();
+    let need_sudo = owner != current_uid();
+    if need_sudo && !sudo {
+        eyre::bail!(
+            "Directory {} is owned by uid={} but sudo is disabled; enable sudo in config",
+            target.display(),
+            owner
+        );
+    }
 
-    let mut command = create_tar_command(sudo, &tarball_path, cwd, targets)?;
+    let dir_name = target
+        .file_name()
+        .ok_or_else(|| eyre!("Failed to extract directory name"))?
+        .to_string_lossy()
+        .into_owned();
+    let tarball_path = base.join(format!("{}.tar.gz", dir_name));
 
-    let output = command.output()
-                        .wrap_err_with(|| format!("Failed to execute tar command for {}", target.display()))?;
+    let rel = target
+        .strip_prefix(cwd)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| target.to_string_lossy().into_owned());
 
-    if !output.status.success() {
-        let error_message = String::from_utf8_lossy(&output.stderr);
-        eyre::bail!("Failed to archive {}: {}", target.display(), error_message);
+    let mut cmd = create_tar_command(need_sudo, &tarball_path, cwd, vec![rel])?;
+    let status = cmd.status()?;
+    if !status.success() {
+        eyre::bail!(
+            "Failed to archive {} (status {})",
+            target.display(),
+            status
+        );
     }
 
     Ok(())
 }
 
-fn archive_group(base: &Path, group: &[PathBuf], sudo: bool, cwd: &Path) -> Result<()> {
-    let group_name = group.first().and_then(|path| path.parent()).and_then(|p| p.file_name())
-        .ok_or_else(|| eyre!("Failed to derive group name"))?
-        .to_string_lossy();
-    let tarball_name = format!("{}.tar.gz", group_name);
-    let tarball_path = base.join(&tarball_name);
-    let targets = group.iter().map(|path| path.to_string_lossy().into_owned()).collect();
+fn is_archive(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()) {
+        matches!(ext.as_str(), "tar" | "gz" | "tgz" | "xz" | "zip" | "7z")
+    } else {
+        false
+    }
+}
 
-    let mut command = create_tar_command(sudo, &tarball_path, cwd, targets)?;
+fn copy_files(base: &Path, loose: &[PathBuf], sudo: bool) -> Result<()> {
+    let me = current_uid();
+    for src in loose {
+        let fname = src.file_name().unwrap();
+        let dest = base.join(fname);
+        let owner = fs::metadata(src)?.uid();
+        if owner == me {
+            // user‑owned: normal copy + preserve perms
+            fs::copy(src, &dest)?;
+            fs::set_permissions(&dest, fs::metadata(src)?.permissions())?;
+        } else {
+            // root‑owned (or other): require sudo
+            if !sudo {
+                eyre::bail!(
+                    "Not permitted to copy {} (owned by uid={}); enable sudo in config",
+                    src.display(),
+                    owner
+                );
+            }
+            let status = Command::new("sudo")
+                .args(&["cp", "-a", src.to_str().unwrap(), dest.to_str().unwrap()])
+                .status()?;
+            if !status.success() {
+                eyre::bail!("`sudo cp -a` failed with status {}", status);
+            }
+        }
+    }
+    Ok(())
+}
 
-    let output = command.output()
-                        .wrap_err_with(|| format!("Failed to execute tar command for group {}", group_name))?;
+fn tar_gz_files(
+    base: &Path,
+    group: &[PathBuf],
+    sudo: bool,
+    cwd: &Path,
+) -> Result<()> {
+    let parent_name = group[0]
+        .parent()
+        .and_then(|p| p.file_name())
+        .ok_or_else(|| eyre!("Cannot determine parent dir for {:?}", group[0]))?
+        .to_string_lossy()
+        .into_owned();
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eyre::bail!("Failed to archive group {}: {}", group_name, stderr);
+    let tarball_path = base.join(format!("{}.tar.gz", parent_name));
+
+    let relative_targets: Vec<String> = group
+        .iter()
+        .map(|p| {
+            p.strip_prefix(cwd)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| p.to_string_lossy().into_owned())
+        })
+        .collect();
+
+    let mut cmd = create_tar_command(sudo, &tarball_path, cwd, relative_targets)?;
+    let status = cmd.status()?;
+    if !status.success() {
+        eyre::bail!(
+            "Failed to create {} (status {})",
+            tarball_path.display(),
+            status
+        );
+    }
+
+    Ok(())
+}
+
+fn archive_group(
+    base: &Path,
+    group: &[PathBuf],
+    sudo: bool,
+    cwd: &Path,
+) -> Result<()> {
+    let need_sudo = group.iter()
+        .map(|p| file_uid(p))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|uid| uid != current_uid());
+
+    if need_sudo && !sudo {
+        eyre::bail!(
+            "Found files owned by another user; re‑run with `sudo = yes` in your config"
+        );
+    }
+
+    let (bundle, loose): (Vec<_>, Vec<_>) = group
+        .iter()
+        .cloned()
+        .partition(|path| !is_archive(path));
+
+    if !loose.is_empty() {
+        copy_files(base, &loose, need_sudo)?;
+    }
+
+    if !bundle.is_empty() {
+        tar_gz_files(base, &bundle, need_sudo, cwd)?;
+    } else {
+        debug!("No files to bundle for this group.");
     }
 
     Ok(())
@@ -414,80 +556,82 @@ fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<()> {
     Ok(())
 }
 
-fn find_tarballs(dir_path: &Path) -> Vec<PathBuf> {
-    debug!("find_tarballs: dir_path={}", dir_path.display());
-    let mut tarballs = Vec::new();
-    if dir_path.is_dir() {
-        for entry in fs::read_dir(dir_path).expect("Directory not found") {
-            let entry = entry.expect("Failed to read entry");
-            let path = entry.path();
-            if path.is_file() && is_tar_gz(&path) {
-                tarballs.push(path);
-            } else {
-                debug!("Skipping non-tarball file: {}", path.display());
-            }
+fn extract_bundle(bundle: &Path, restore_to: &Path, sudo: bool) -> Result<()> {
+    let owner = fs::metadata(bundle)?.uid();
+    let me = current_uid();
+
+    let status = if owner != me {
+        if !sudo {
+            eyre::bail!(
+                "Cannot extract root-owned archive {} without sudo enabled",
+                bundle.display()
+            );
         }
+        Command::new("sudo")
+            .args(&[
+                "tar", "xpf",
+                bundle.to_str().unwrap(),
+                "-C", restore_to.to_str().unwrap(),
+                "--same-owner",
+            ])
+            .status()?
+    } else {
+        Command::new("tar")
+            .args(&[
+                "xzf",
+                bundle.to_str().unwrap(),
+                "-C", restore_to.to_str().unwrap(),
+            ])
+            .status()?
+    };
+
+    if !status.success() {
+        eyre::bail!("tar extraction failed with status {}", status);
     }
-    tarballs
-}
-
-fn is_tar_gz(path: &Path) -> bool {
-    match path.to_str() {
-        Some(s) => s.ends_with(".tar.gz"),
-        None => false,
-    }
-}
-
-fn extract_tarball(tarball_path: &Path, restore_path: &Path) -> Result<()> {
-    debug!("Extracting {} to {}", tarball_path.display(), restore_path.display());
-
-    let output = Command::new("tar")
-        .arg("-xzf")
-        .arg(tarball_path)
-        .arg("-C")
-        .arg(restore_path)
-        .output()
-        .expect("Failed to execute tar command");
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(eyre!("Tar extraction failed: {}", stderr));
-    }
-
     Ok(())
 }
 
-// given the following timestamp directory:
-// ~ via 🐍 v3.10.12 via 🦀 v1.76.0 on ☁️  (us-west-2) on ☁️
-// ❯ tree -a -I '.*|__*|tf|venv|target|incremental' /var/tmp/rmrf/1708380459/
-// /var/tmp/rmrf/1708380459/
-// ├── apple.tar.gz
-// ├── banana.tar.gz
-// └── metadata.yml
-//
-// The user can supply one of the following targets to recover:
-// /var/tmp/rmrf/1708380459/   this will recover all of the files: apple.tar.gz, banana.tar.gz
-//
-// After the files have been successfully recovered, the program will remove the timestamp directory.
-//
-// The process should be the same, get the recovery path by getting the cwd value by loading the
-// metata.yml file. Then the untar should place the files relative to the cwd value.
-fn recover(dir: &Path, targets: &[PathBuf]) -> Result<()> {
-    let dir = dir.canonicalize().wrap_err("Failed to canonicalize rmrf path")?;
-    debug!("recover: dir={} targets={}", dir.display(), targets.iter().map(|t| t.to_string_lossy()).collect::<Vec<_>>().join(", "));
+fn recover(root: &Path, ts_dirs: &[PathBuf], sudo: bool) -> Result<()> {
+    for ts in ts_dirs {
+        let ts_path = if ts.is_absolute() {
+            ts.clone()
+        } else {
+            root.join(ts)
+        };
+        let ts_dir = ts_path
+            .canonicalize()
+            .wrap_err("canonicalizing timestamp dir")?;
 
-    for target in targets {
-        let metadata_path = target.join("metadata.yml");
-        let metadata: Metadata = serde_yaml::from_reader(File::open(&metadata_path).wrap_err("Failed to open metadata.yml")?)?;
+        let meta_path = ts_dir.join("metadata.yml");
+        let meta: Metadata = serde_yaml::from_reader(
+            File::open(&meta_path).wrap_err("opening metadata.yml")?
+        )
+        .wrap_err("parsing metadata.yml")?;
+        let cwd = meta.cwd;
+        let originals = &meta.targets;
 
-        let tarballs = find_tarballs(target);
-        for tarball in tarballs {
-            debug!("Recovering tarball: {}", tarball.display());
-            extract_tarball(&tarball, &metadata.cwd)?;
+        let (to_copy, to_extract): (Vec<PathBuf>, Vec<PathBuf>) =
+            fs::read_dir(&ts_dir)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some("metadata.yml"))
+                .partition(|p| {
+                    let fname = p.file_name().unwrap().to_string_lossy();
+                    originals.iter().any(|t| t == &fname)
+                });
+
+        for bundle in to_extract {
+            info!("Extracting {} → {}", bundle.display(), cwd.display());
+            extract_bundle(&bundle, &cwd, sudo)?;
         }
-    }
-    fs::remove_dir_all(dir).wrap_err("Failed to remove the directory after recovery")?;
 
+        for src in to_copy {
+            info!("Restoring {} → {}", src.display(), cwd.display());
+            copy_files(&cwd, &[src], sudo)?;
+        }
+
+        fs::remove_dir_all(&ts_dir)
+            .wrap_err_with(|| format!("removing {}", ts_dir.display()))?;
+    }
     Ok(())
 }
 
@@ -552,8 +696,8 @@ fn main() -> Result<()> {
                 archive(&rmrf_path, timestamp, &as_paths(&args.targets), sudo, true, Some(days))?;
             },
             Action::Rcvr(args) => {
-                recover(&rmrf_path, &as_paths(&args.targets))?;
-            },
+                recover(&rmrf_path, &as_paths(&args.targets), sudo)?;
+            }
             Action::LsBkup(args) => {
                 list(&bkup_path, &args.targets, threshold)?;
             },
@@ -565,7 +709,6 @@ fn main() -> Result<()> {
             }
         },
         None => {
-            // This is the default Rmrf action
             archive(&rmrf_path, timestamp, &as_paths(&matches.targets), sudo, true, Some(days))?;
         }
     }
