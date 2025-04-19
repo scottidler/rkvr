@@ -402,6 +402,24 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
     Ok((directories, groups))
 }
 
+fn output(base: &Path, targets: &[PathBuf]) {
+    for target in targets {
+        println!("{}", target.display());
+    }
+    println!("-> {}/", base.display());
+}
+
+fn remove_targets(targets: &[PathBuf]) -> Result<()> {
+    for target in targets {
+        if target.is_dir() {
+            fs::remove_dir_all(target)?;
+        } else {
+            fs::remove_file(target)?;
+        }
+    }
+    Ok(())
+}
+
 fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
     let cwd = env::current_dir().wrap_err("Failed to get current directory")?;
     let base = path.join(timestamp.to_string());
@@ -420,26 +438,14 @@ fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove:
     })?;
 
     if remove {
-        remove_targets(&base, targets)?;
+        remove_targets(targets)?;
     }
+    output(&base, targets);
 
     if let Some(days) = keep {
         cleanup(&path, days as usize)?;
     }
 
-    Ok(())
-}
-
-fn remove_targets(base: &Path, targets: &[PathBuf]) -> Result<()> {
-    for target in targets {
-        if target.is_dir() {
-            fs::remove_dir_all(target)?;
-        } else {
-            fs::remove_file(target)?;
-        }
-        println!("{}", target.display());
-    }
-    println!("-> {}/", base.display());
     Ok(())
 }
 
