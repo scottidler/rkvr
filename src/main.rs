@@ -34,9 +34,9 @@ mod built_info {
 #[derive(Serialize, Deserialize, Debug)]
 struct Metadata {
     cwd: PathBuf,
-    contents: String,
     #[serde(default)]
     targets: Vec<String>,
+    contents: String,
 }
 
 fn as_paths(paths: &[String]) -> Vec<PathBuf> {
