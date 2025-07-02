@@ -1,6 +1,6 @@
 // build.rs
 use std::env;
-use std::fs::{File, read_to_string};
+use std::fs::{read_to_string, File};
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
@@ -16,10 +16,12 @@ fn git_describe_value() -> String {
         .args(&["describe", "--tags", "--always"])
         .output()
         .ok()
-        .and_then(|output| if output.status.success() {
-            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-        } else {
-            None
+        .and_then(|output| {
+            if output.status.success() {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                None
+            }
         })
         .unwrap_or_else(|| "unknown".to_string())
 }
@@ -43,4 +45,3 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-env-changed=GIT_DESCRIBE");
 }
-
