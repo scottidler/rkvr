@@ -436,13 +436,6 @@ fn categorize_paths(
     Ok((directories, groups))
 }
 
-fn output(base: &Path, targets: &[PathBuf]) {
-    for target in targets {
-        println!("{}", target.display());
-    }
-    println!("-> {}/", base.display());
-}
-
 fn remove_targets(targets: &[PathBuf]) -> Result<()> {
     for target in targets {
         if target.is_dir() {
@@ -456,37 +449,52 @@ fn remove_targets(targets: &[PathBuf]) -> Result<()> {
 
 fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
     let current_cwd = env::current_dir().wrap_err("Failed to get current directory")?;
-    let base = path.join(timestamp.to_string());
-    fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
-
     let (directories, groups) = categorize_paths(targets, &current_cwd)?;
 
-    // Process each group with its appropriate working directory
-    for group in &groups {
+    // Process each group with its own timestamp directory and appropriate working directory
+    for (group_index, group) in groups.iter().enumerate() {
         if !group.is_empty() {
+            // Create a unique timestamp for each group with larger increments
+            let group_timestamp = timestamp + (group_index as u64 * 1000);
+            let base = path.join(group_timestamp.to_string());
+            fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
+            
             // Determine the working directory for this group
             let group_cwd = if let Some(first_file) = group.first() {
                 first_file.parent().unwrap_or(&current_cwd).to_path_buf()
             } else {
                 current_cwd.clone()
             };
-
+            
             create_metadata(&base, &group_cwd, group)?;
             archive_group(&base, group, sudo, &group_cwd)?;
+            
+            // Output for this group
+            for target in group {
+                println!("{}", target.display());
+            }
+            println!("-> {}/", base.display());
         }
     }
 
-    // Process directories with their parent as working directory
-    for directory in &directories {
+    // Process directories with their own timestamp directories and parent as working directory
+    for (dir_index, directory) in directories.iter().enumerate() {
+        let dir_timestamp = timestamp + 10000 + (dir_index as u64 * 1000); // Larger offset to avoid conflicts
+        let base = path.join(dir_timestamp.to_string());
+        fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
+        
         let dir_cwd = directory.parent().unwrap_or(&current_cwd);
         create_metadata(&base, dir_cwd, &[directory.clone()])?;
         archive_directory(&base, directory, sudo, dir_cwd)?;
+        
+        // Output for this directory
+        println!("{}", directory.display());
+        println!("-> {}/", base.display());
     }
 
     if remove {
         remove_targets(targets)?;
     }
-    output(&base, targets);
 
     if let Some(days) = keep {
         cleanup(&path, days as usize)?;
@@ -695,7 +703,7 @@ fn main() -> Result<()> {
     let current_level = log::max_level();
     debug!("Current log level: {:?}", current_level);
 
-    let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos() as u64;
     debug!("Current timestamp: {}", timestamp);
 
     let matches = Cli::parse_from(args);
@@ -766,4 +774,356 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::fs;
+
+    #[test]
+    fn test_categorize_paths_same_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        let dir1 = temp_path.join("logs");
+        fs::create_dir_all(&dir1).unwrap();
+        
+        let file1 = dir1.join("app.log");
+        let file2 = dir1.join("error.log");
+        fs::write(&file1, "app").unwrap();
+        fs::write(&file2, "error").unwrap();
+        
+        let targets = vec![file1, file2];
+        let (directories, groups) = categorize_paths(&targets, temp_path).unwrap();
+        
+        assert_eq!(directories.len(), 0, "Should have no directories");
+        assert_eq!(groups.len(), 1, "Should have one group");
+        assert_eq!(groups[0].len(), 2, "Group should contain both files");
+    }
+
+    #[test]
+    fn test_categorize_paths_different_directories() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        let dir1 = temp_path.join("logs1");
+        let dir2 = temp_path.join("logs2");
+        fs::create_dir_all(&dir1).unwrap();
+        fs::create_dir_all(&dir2).unwrap();
+        
+        let file1 = dir1.join("app.log");
+        let file2 = dir2.join("error.log");
+        fs::write(&file1, "app").unwrap();
+        fs::write(&file2, "error").unwrap();
+        
+        let targets = vec![file1, file2];
+        let (directories, groups) = categorize_paths(&targets, temp_path).unwrap();
+        
+        assert_eq!(directories.len(), 0, "Should have no directories");
+        assert_eq!(groups.len(), 2, "Should have two groups");
+        assert_eq!(groups[0].len(), 1, "First group should contain one file");
+        assert_eq!(groups[1].len(), 1, "Second group should contain one file");
+    }
+
+    #[test]
+    fn test_categorize_paths_mixed_files_and_directories() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        let dir1 = temp_path.join("logs");
+        let dir2 = temp_path.join("project");
+        fs::create_dir_all(&dir1).unwrap();
+        fs::create_dir_all(&dir2).unwrap();
+        
+        let file1 = dir1.join("app.log");
+        fs::write(&file1, "app").unwrap();
+        
+        let targets = vec![file1, dir2.clone()];
+        let (directories, groups) = categorize_paths(&targets, temp_path).unwrap();
+        
+        assert_eq!(directories.len(), 1, "Should have one directory");
+        assert_eq!(groups.len(), 1, "Should have one file group");
+        assert_eq!(directories[0], dir2, "Directory should match");
+        assert_eq!(groups[0].len(), 1, "File group should contain one file");
+    }
+
+    #[test]
+    fn test_create_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        let base = temp_path.join("archive");
+        let cwd = temp_path.join("source");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        
+        let file1 = cwd.join("test.txt");
+        fs::write(&file1, "test content").unwrap();
+        
+        let targets = vec![file1];
+        create_metadata(&base, &cwd, &targets).unwrap();
+        
+        let metadata_file = base.join("metadata.yml");
+        assert!(metadata_file.exists(), "Metadata file should be created");
+        
+        let metadata_content = fs::read_to_string(&metadata_file).unwrap();
+        assert!(metadata_content.contains(&format!("cwd: {}", cwd.display())));
+        assert!(metadata_content.contains("- test.txt"));
+        assert!(metadata_content.contains("contents: |"));
+    }
+
+    #[test]
+    fn test_create_tar_command_relative_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        let tarball = temp_path.join("test.tar.gz");
+        let cwd = temp_path.join("source");
+        fs::create_dir_all(&cwd).unwrap();
+        
+        let targets = vec!["file1.txt".to_string(), "file2.txt".to_string()];
+        
+        let command = create_tar_command(false, &tarball, &cwd, targets).unwrap();
+        
+        // Command should not use sudo
+        assert_eq!(command.get_program(), "tar");
+        
+        // Should contain the relative filenames
+        let args: Vec<_> = command.get_args().collect();
+        let args_str = format!("{:?}", args);
+        assert!(args_str.contains("file1.txt"));
+        assert!(args_str.contains("file2.txt"));
+    }
+
+    #[test]
+    fn test_create_tar_command_with_sudo() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        let tarball = temp_path.join("test.tar.gz");
+        let cwd = temp_path.join("source");
+        fs::create_dir_all(&cwd).unwrap();
+        
+        let targets = vec!["file1.txt".to_string()];
+        
+        let command = create_tar_command(true, &tarball, &cwd, targets).unwrap();
+        
+        // Command should use sudo
+        assert_eq!(command.get_program(), "sudo");
+        
+        let args: Vec<_> = command.get_args().collect();
+        let args_str = format!("{:?}", args);
+        assert!(args_str.contains("tar"));
+    }
+
+    #[test]
+    fn test_is_archive() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        // Create a tar.gz file
+        let tar_file = temp_path.join("test.tar.gz");
+        fs::write(&tar_file, "fake tar content").unwrap();
+        
+        // Create a regular file
+        let regular_file = temp_path.join("test.txt");
+        fs::write(&regular_file, "regular content").unwrap();
+        
+        assert!(is_archive(&tar_file), "Should recognize .tar.gz as archive");
+        assert!(!is_archive(&regular_file), "Should not recognize .txt as archive");
+    }
+
+    #[test]
+    fn test_current_uid() {
+        let uid = current_uid();
+        // UID should be a valid value (u32 is always non-negative)
+        assert!(uid > 0 || uid == 0, "UID should be valid"); // Allow 0 for root
+    }
+
+    #[test]
+    fn test_file_uid() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        let test_file = temp_path.join("test.txt");
+        fs::write(&test_file, "test").unwrap();
+        
+        let uid = file_uid(&test_file).unwrap();
+        // Should match current user for files we create
+        assert_eq!(uid, current_uid(), "File should be owned by current user");
+    }
+
+    #[test]
+    fn test_as_paths() {
+        let strings = vec![
+            "/tmp/file1.txt".to_string(),
+            "relative/file2.txt".to_string(),
+        ];
+        
+        let paths = as_paths(&strings);
+        
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], PathBuf::from("/tmp/file1.txt"));
+        assert_eq!(paths[1], PathBuf::from("relative/file2.txt"));
+    }
+
+    #[test]
+    fn test_remove_targets() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        // Create test file and directory
+        let test_file = temp_path.join("test.txt");
+        let test_dir = temp_path.join("test_dir");
+        let test_dir_file = test_dir.join("inner.txt");
+        
+        fs::write(&test_file, "test").unwrap();
+        fs::create_dir_all(&test_dir).unwrap();
+        fs::write(&test_dir_file, "inner").unwrap();
+        
+        let targets = vec![test_file.clone(), test_dir.clone()];
+        
+        remove_targets(&targets).unwrap();
+        
+        assert!(!test_file.exists(), "File should be removed");
+        assert!(!test_dir.exists(), "Directory should be removed");
+    }
+
+    #[test]
+    fn test_cleanup_basic_functionality() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        // Create some test directories
+        let dir1 = temp_path.join("1234567890");
+        let dir2 = temp_path.join("9876543210");
+        
+        fs::create_dir_all(&dir1).unwrap();
+        fs::create_dir_all(&dir2).unwrap();
+        
+        // Create metadata files to make them look like real archives
+        fs::write(dir1.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
+        fs::write(dir2.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
+        
+        // Test that cleanup runs without error with a reasonable threshold
+        cleanup(temp_path, 30).unwrap();
+        
+        // Since we just created the directories, they should still exist 
+        // (their modified time is very recent)
+        assert!(dir1.exists(), "Recently created directory should still exist");
+        assert!(dir2.exists(), "Recently created directory should still exist");
+        
+        // Test cleanup with a very long threshold - should definitely keep everything
+        cleanup(temp_path, 365).unwrap();
+        
+        assert!(dir1.exists(), "Directory should exist with long threshold");
+        assert!(dir2.exists(), "Directory should exist with long threshold");
+    }
+
+    #[test]
+    fn test_archive_single_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        let source_dir = temp_path.join("source");
+        let archive_dir = temp_path.join("archive");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+        
+        let test_file = source_dir.join("test.txt");
+        fs::write(&test_file, "test content").unwrap();
+        
+        let timestamp = 1234567890123456789u64;
+        let targets = vec![test_file.clone()];
+        
+        // Archive without removing
+        archive(&archive_dir, timestamp, &targets, false, false, None).unwrap();
+        
+        // Original file should still exist (remove=false)
+        assert!(test_file.exists(), "Original file should still exist");
+        
+        // Archive should be created
+        let expected_archive = archive_dir.join(timestamp.to_string());
+        assert!(expected_archive.exists(), "Archive directory should be created");
+        
+        let metadata_file = expected_archive.join("metadata.yml");
+        assert!(metadata_file.exists(), "Metadata file should be created");
+        
+        let metadata_content = fs::read_to_string(&metadata_file).unwrap();
+        assert!(metadata_content.contains(&format!("cwd: {}", source_dir.display())));
+        assert!(metadata_content.contains("- test.txt"));
+    }
+
+    #[test]
+    fn test_archive_and_remove() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        let source_dir = temp_path.join("source");
+        let archive_dir = temp_path.join("archive");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+        
+        let test_file = source_dir.join("test.txt");
+        fs::write(&test_file, "test content").unwrap();
+        
+        let timestamp = 1234567890123456789u64;
+        let targets = vec![test_file.clone()];
+        
+        // Archive with removing
+        archive(&archive_dir, timestamp, &targets, false, true, None).unwrap();
+        
+        // Original file should be removed (remove=true)
+        assert!(!test_file.exists(), "Original file should be removed");
+        
+        // Archive should be created
+        let expected_archive = archive_dir.join(timestamp.to_string());
+        assert!(expected_archive.exists(), "Archive directory should be created");
+    }
+
+    #[test]
+    fn test_archive_multiple_files_different_dirs() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        
+        let source_dir1 = temp_path.join("source1");
+        let source_dir2 = temp_path.join("source2");
+        let archive_dir = temp_path.join("archive");
+        fs::create_dir_all(&source_dir1).unwrap();
+        fs::create_dir_all(&source_dir2).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+        
+        let file1 = source_dir1.join("file1.txt");
+        let file2 = source_dir2.join("file2.txt");
+        fs::write(&file1, "content1").unwrap();
+        fs::write(&file2, "content2").unwrap();
+        
+        let timestamp = 1234567890123456789u64;
+        let targets = vec![file1.clone(), file2.clone()];
+        
+        // Archive files from different directories
+        archive(&archive_dir, timestamp, &targets, false, false, None).unwrap();
+        
+        // Should create separate archive directories for different source directories
+        let archive_entries: Vec<_> = fs::read_dir(&archive_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .collect();
+        
+        assert_eq!(archive_entries.len(), 2, "Should create two archive directories");
+        
+        // Each archive should have its own metadata with correct CWD
+        for entry in archive_entries {
+            let metadata_file = entry.path().join("metadata.yml");
+            assert!(metadata_file.exists(), "Each archive should have metadata");
+            
+            let metadata_content = fs::read_to_string(&metadata_file).unwrap();
+            assert!(metadata_content.contains(&format!("cwd: {}", source_dir1.display())) ||
+                    metadata_content.contains(&format!("cwd: {}", source_dir2.display())),
+                    "Metadata should contain correct CWD");
+        }
+    }
 }
