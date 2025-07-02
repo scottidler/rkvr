@@ -2,7 +2,7 @@
 use log::{debug, info};
 use std::fs::{self, File, DirEntry};
 use std::path::{Path, PathBuf};
-use std::io::{self, Write, BufWriter};
+use std::io::{self, ErrorKind, Write, BufWriter};
 use std::process::{Command, Stdio, ChildStdin};
 use std::time::SystemTime;
 use std::collections::HashMap;
@@ -11,7 +11,6 @@ use libc::getuid;
 use std::env;
 
 // Third-party crate imports
-use rayon::prelude::*;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::{Serialize, Deserialize};
@@ -189,11 +188,21 @@ fn create_tar_command(
     let relative_targets: Vec<String> = targets
         .into_iter()
         .map(|t| {
-            Path::new(&t)
-                .strip_prefix(cwd)
-                .unwrap_or(Path::new(&t))
-                .to_string_lossy()
-                .into_owned()
+            let target_path = Path::new(&t);
+            // If the target is absolute, try to make it relative to cwd
+            if target_path.is_absolute() {
+                target_path
+                    .strip_prefix(cwd)
+                    .map(|rel| rel.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| {
+                        // If we can't make it relative, use just the filename
+                        target_path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| t.clone())
+                    })
+            } else {
+                t
+            }
         })
         .collect();
 
@@ -236,7 +245,11 @@ fn archive_directory(
     let rel = target
         .strip_prefix(cwd)
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| target.to_string_lossy().into_owned());
+        .unwrap_or_else(|_| {
+            target.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| target.to_string_lossy().into_owned())
+        });
 
     let mut cmd = create_tar_command(need_sudo, &tarball_path, cwd, vec![rel])?;
     let status = cmd.status()?;
@@ -307,9 +320,14 @@ fn tar_gz_files(
     let relative_targets: Vec<String> = group
         .iter()
         .map(|p| {
+            // Try to make path relative to cwd, otherwise use filename
             p.strip_prefix(cwd)
                 .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| {
+                    p.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.to_string_lossy().into_owned())
+                })
         })
         .collect();
 
@@ -362,33 +380,49 @@ fn archive_group(
     Ok(())
 }
 
-fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Vec<Vec<PathBuf>>)> {
+fn categorize_paths(
+    targets: &[PathBuf],
+    cwd: &Path,
+) -> Result<(Vec<PathBuf>, Vec<Vec<PathBuf>>)> {
     let mut directories = Vec::new();
     let mut file_groups_map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+
     let cwd_canonical = fs::canonicalize(cwd).wrap_err("Failed to canonicalize cwd")?;
     debug!("Canonicalized cwd: {}", cwd_canonical.display());
 
     for target in targets {
-        let canonical_path = fs::canonicalize(target)
-            .wrap_err_with(|| format!("Failed to canonicalize target: {}", target.display()))?;
+        let canonical_path = fs::canonicalize(target).map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                eyre!("{}: No such file or directory", target.display())
+            } else {
+                eyre!("Failed to canonicalize target {}: {}", target.display(), e)
+            }
+        })?;
         debug!("Canonicalized target: {}", canonical_path.display());
 
         let relative_path = match canonical_path.strip_prefix(&cwd_canonical) {
             Ok(rel_path) => rel_path.to_path_buf(),
             Err(e) => {
-                debug!("Unable to strip prefix from path '{}': {}", canonical_path.display(), e);
+                debug!(
+                    "Unable to strip prefix from path '{}': {}",
+                    canonical_path.display(),
+                    e
+                );
                 canonical_path.clone()
-            },
+            }
         };
         debug!("Relative path: {}", relative_path.display());
 
         if canonical_path.is_dir() {
             directories.push(canonical_path);
         } else {
-            let group_key = relative_path.parent()
+            let group_key = relative_path
+                .parent()
                 .map(|p| cwd_canonical.join(p))
                 .unwrap_or_else(|| canonical_path.parent().unwrap().to_path_buf());
-            file_groups_map.entry(group_key)
+
+            file_groups_map
+                .entry(group_key)
                 .or_insert_with(Vec::new)
                 .push(canonical_path);
         }
@@ -421,21 +455,33 @@ fn remove_targets(targets: &[PathBuf]) -> Result<()> {
 }
 
 fn archive(path: &Path, timestamp: u64, targets: &[PathBuf], sudo: bool, remove: bool, keep: Option<i32>) -> Result<()> {
-    let cwd = env::current_dir().wrap_err("Failed to get current directory")?;
+    let current_cwd = env::current_dir().wrap_err("Failed to get current directory")?;
     let base = path.join(timestamp.to_string());
     fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
 
-    create_metadata(&base, &cwd, targets)?;
+    let (directories, groups) = categorize_paths(targets, &current_cwd)?;
 
-    let (directories, groups) = categorize_paths(targets, &cwd)?;
+    // Process each group with its appropriate working directory
+    for group in &groups {
+        if !group.is_empty() {
+            // Determine the working directory for this group
+            let group_cwd = if let Some(first_file) = group.first() {
+                first_file.parent().unwrap_or(&current_cwd).to_path_buf()
+            } else {
+                current_cwd.clone()
+            };
 
-    directories.par_iter().try_for_each(|directory| {
-        archive_directory(&base, directory, sudo, &cwd)
-    })?;
+            create_metadata(&base, &group_cwd, group)?;
+            archive_group(&base, group, sudo, &group_cwd)?;
+        }
+    }
 
-    groups.par_iter().try_for_each(|group| {
-        archive_group(&base, group, sudo, &cwd)
-    })?;
+    // Process directories with their parent as working directory
+    for directory in &directories {
+        let dir_cwd = directory.parent().unwrap_or(&current_cwd);
+        create_metadata(&base, dir_cwd, &[directory.clone()])?;
+        archive_directory(&base, directory, sudo, dir_cwd)?;
+    }
 
     if remove {
         remove_targets(targets)?;
