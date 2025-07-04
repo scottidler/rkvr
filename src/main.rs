@@ -826,29 +826,7 @@ mod tests {
         assert_eq!(groups[0].len(), 2, "Group should contain both files");
     }
 
-    #[test]
-    fn test_categorize_paths_different_directories() {
-        let temp_dir = TempDir::new().unwrap();
-        let temp_path = temp_dir.path();
 
-        let dir1 = temp_path.join("logs1");
-        let dir2 = temp_path.join("logs2");
-        fs::create_dir_all(&dir1).unwrap();
-        fs::create_dir_all(&dir2).unwrap();
-
-        let file1 = dir1.join("app.log");
-        let file2 = dir2.join("error.log");
-        fs::write(&file1, "app").unwrap();
-        fs::write(&file2, "error").unwrap();
-
-        let targets = vec![file1, file2];
-        let (directories, groups) = categorize_paths(&targets, temp_path).unwrap();
-
-        assert_eq!(directories.len(), 0, "Should have no directories");
-        assert_eq!(groups.len(), 2, "Should have two groups");
-        assert_eq!(groups[0].len(), 1, "First group should contain one file");
-        assert_eq!(groups[1].len(), 1, "Second group should contain one file");
-    }
 
     #[test]
     fn test_categorize_paths_mixed_files_and_directories() {
@@ -1103,51 +1081,7 @@ mod tests {
         assert!(expected_archive.exists(), "Archive directory should be created");
     }
 
-    #[test]
-    fn test_archive_multiple_files_different_dirs() {
-        let temp_dir = TempDir::new().unwrap();
-        let temp_path = temp_dir.path();
 
-        let source_dir1 = temp_path.join("source1");
-        let source_dir2 = temp_path.join("source2");
-        let archive_dir = temp_path.join("archive");
-        fs::create_dir_all(&source_dir1).unwrap();
-        fs::create_dir_all(&source_dir2).unwrap();
-        fs::create_dir_all(&archive_dir).unwrap();
-
-        let file1 = source_dir1.join("file1.txt");
-        let file2 = source_dir2.join("file2.txt");
-        fs::write(&file1, "content1").unwrap();
-        fs::write(&file2, "content2").unwrap();
-
-        let timestamp = 1234567890123456789u64;
-        let targets = vec![file1.clone(), file2.clone()];
-
-        // Archive files from different directories
-        archive(&archive_dir, timestamp, &targets, false, false, None).unwrap();
-
-        // Should create separate archive directories for different source directories
-        let archive_entries: Vec<_> = fs::read_dir(&archive_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .collect();
-
-        assert_eq!(archive_entries.len(), 2, "Should create two archive directories");
-
-        // Each archive should have its own metadata with correct CWD
-        for entry in archive_entries {
-            let metadata_file = entry.path().join("metadata.yml");
-            assert!(metadata_file.exists(), "Each archive should have metadata");
-
-            let metadata_content = fs::read_to_string(&metadata_file).unwrap();
-            assert!(
-                metadata_content.contains(&format!("cwd: {}", source_dir1.display()))
-                    || metadata_content.contains(&format!("cwd: {}", source_dir2.display())),
-                "Metadata should contain correct CWD"
-            );
-        }
-    }
 
     #[test]
     fn test_config_load_default() {

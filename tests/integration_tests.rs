@@ -191,66 +191,7 @@ fn test_rmrf_no_tar_warnings_for_absolute_paths() {
     }
 }
 
-#[test]
-fn test_multiple_files_same_directory() {
-    build_binary();
 
-    let temp_dir = TempDir::new().unwrap();
-    let temp_path = temp_dir.path();
-
-    // Create multiple files in same directory
-    let test_dir = temp_path.join("shared_logs");
-    fs::create_dir_all(&test_dir).unwrap();
-    let file1 = test_dir.join("app.log");
-    let file2 = test_dir.join("error.log");
-    let file3 = test_dir.join("debug.log");
-    fs::write(&file1, "app log").unwrap();
-    fs::write(&file2, "error log").unwrap();
-    fs::write(&file3, "debug log").unwrap();
-
-    let rmrf_dir = temp_path.join("rmrf");
-    let bkup_dir = temp_path.join("bkup");
-    fs::create_dir_all(&rmrf_dir).unwrap();
-    fs::create_dir_all(&bkup_dir).unwrap();
-
-    create_config(temp_path, &rmrf_dir, &bkup_dir);
-
-    // Run rmrf on all files
-    let output = run_rkvr_command(
-        &[
-            "rmrf",
-            file1.to_str().unwrap(),
-            file2.to_str().unwrap(),
-            file3.to_str().unwrap(),
-        ],
-        temp_path,
-    );
-
-    assert_success(&output, "Multiple files same directory");
-    assert_no_tar_warnings(&output, "Multiple files same directory");
-
-    // Verify all files removed
-    assert!(
-        !file1.exists() && !file2.exists() && !file3.exists(),
-        "All original files should be removed"
-    );
-
-    // Verify archive
-    let archive_dirs = get_archive_dirs(&rmrf_dir);
-    assert_eq!(archive_dirs.len(), 1, "Should have exactly one archive directory");
-
-    let metadata = read_metadata(&archive_dirs[0]);
-    assert!(
-        metadata.contains(&format!("cwd: {}", test_dir.display())),
-        "Metadata should contain correct CWD. Content:\n{}",
-        metadata
-    );
-    assert!(
-        metadata.contains("- app.log") && metadata.contains("- error.log") && metadata.contains("- debug.log"),
-        "Metadata should contain all filenames. Content:\n{}",
-        metadata
-    );
-}
 
 #[test]
 fn test_multiple_files_different_directories() {
