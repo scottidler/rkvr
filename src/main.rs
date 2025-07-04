@@ -9,12 +9,14 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::time::SystemTime;
+use std::fs::OpenOptions;
 
 // Third-party crate imports
 use atty::Stream;
 use clap::Parser;
 use configparser::ini::Ini;
 use dirs;
+use env_logger::Target;
 use eyre::{eyre, Context, Result};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -77,17 +79,12 @@ fn get_log_file_path() -> Result<PathBuf> {
 fn setup_logging() -> Result<()> {
     let log_file_path = get_log_file_path()?;
 
-    // Check if RUST_LOG is set - if so, let env_logger handle it
     if env::var("RUST_LOG").is_ok() {
         env_logger::init();
         info!("Using RUST_LOG environment variable for logging configuration");
         info!("Log file location: {}", log_file_path.display());
         return Ok(());
     }
-
-    // Otherwise, use env_logger with file output
-    use std::fs::OpenOptions;
-    use env_logger::Target;
 
     let log_file = OpenOptions::new()
         .create(true)
@@ -116,7 +113,6 @@ fn setup_logging() -> Result<()> {
 
 
 fn current_uid() -> u32 {
-    // unsafe call into libc
     unsafe { getuid() as u32 }
 }
 
@@ -214,13 +210,11 @@ fn create_tar_command(sudo: bool, tarball_path: &Path, cwd: &Path, targets: Vec<
         .into_iter()
         .map(|t| {
             let target_path = Path::new(&t);
-            // If the target is absolute, try to make it relative to cwd
             if target_path.is_absolute() {
                 target_path
                     .strip_prefix(cwd)
                     .map(|rel| rel.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| {
-                        // If we can't make it relative, use just the filename
                         target_path
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
@@ -303,11 +297,9 @@ fn copy_files(base: &Path, loose: &[PathBuf], sudo: bool) -> Result<()> {
         let dest = base.join(fname);
         let owner = fs::metadata(src)?.uid();
         if owner == me {
-            // user‑owned: normal copy + preserve perms
             fs::copy(src, &dest)?;
             fs::set_permissions(&dest, fs::metadata(src)?.permissions())?;
         } else {
-            // root‑owned (or other): require sudo
             if !sudo {
                 eyre::bail!(
                     "Not permitted to copy {} (owned by uid={}); enable sudo in config",
@@ -339,7 +331,6 @@ fn tar_gz_files(base: &Path, group: &[PathBuf], sudo: bool, cwd: &Path) -> Resul
     let relative_targets: Vec<String> = group
         .iter()
         .map(|p| {
-            // Try to make path relative to cwd, otherwise use filename
             p.strip_prefix(cwd)
                 .map(|r| r.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| {
@@ -457,15 +448,12 @@ fn archive(
     let current_cwd = env::current_dir().wrap_err("Failed to get current directory")?;
     let (directories, groups) = categorize_paths(targets, &current_cwd)?;
 
-    // Process each group with its own timestamp directory and appropriate working directory
     for (group_index, group) in groups.iter().enumerate() {
         if !group.is_empty() {
-            // Create a unique timestamp for each group with larger increments
             let group_timestamp = timestamp + (group_index as u64 * 1000);
             let base = path.join(group_timestamp.to_string());
             fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
 
-            // Determine the working directory for this group
             let group_cwd = if let Some(first_file) = group.first() {
                 first_file.parent().unwrap_or(&current_cwd).to_path_buf()
             } else {
@@ -475,7 +463,6 @@ fn archive(
             create_metadata(&base, &group_cwd, group)?;
             archive_group(&base, group, sudo, &group_cwd)?;
 
-            // Output for this group
             for target in group {
                 println!("{}", target.display());
             }
@@ -483,9 +470,8 @@ fn archive(
         }
     }
 
-    // Process directories with their own timestamp directories and parent as working directory
     for (dir_index, directory) in directories.iter().enumerate() {
-        let dir_timestamp = timestamp + 10000 + (dir_index as u64 * 1000); // Larger offset to avoid conflicts
+        let dir_timestamp = timestamp + 10000 + (dir_index as u64 * 1000);
         let base = path.join(dir_timestamp.to_string());
         fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
 
@@ -493,7 +479,6 @@ fn archive(
         create_metadata(&base, dir_cwd, &[directory.clone()])?;
         archive_directory(&base, directory, sudo, dir_cwd)?;
 
-        // Output for this directory
         println!("{}", directory.display());
         println!("-> {}/", base.display());
     }
@@ -586,27 +571,25 @@ fn process_directory(matcher: &SkimMatcherV2, dir: &DirEntry, patterns: &[String
 }
 
 fn format_directory(dir_path: &Path) -> Result<String> {
-    let mut output = format!("{}", dir_path.display().to_string().blue().bold());
+    let mut output = format!("{}", dir_path.display().to_string().bright_blue().bold());
     let metadata_path = dir_path.join("metadata.yml");
     if let Ok(metadata_content) = fs::read_to_string(&metadata_path) {
         let formatted_lines: Vec<String> = metadata_content.lines().map(|line| {
             if line.starts_with("cwd:") {
                 let parts: Vec<&str> = line.splitn(2, ':').collect();
                 if parts.len() == 2 {
-                    format!("  {}: {}", "cwd".bright_white().bold(), parts[1].trim().red())
+                    format!("  {}: {}", "cwd".white(), parts[1].trim().bright_red())
                 } else {
                     format!("  {}", line)
                 }
             } else if line.starts_with("targets:") {
-                format!("  {}", "targets:".bright_white().bold())
+                format!("  {}", "targets:".white())
             } else if line.starts_with("contents:") {
-                format!("  {}", "contents:".bright_white().bold())
+                format!("  {}", "contents:".white())
             } else if line.starts_with("- ") {
-                // Target file names in red
-                format!("  {}", line.red())
+                format!("  {}", line.bright_red())
             } else if line.starts_with("  ") && !line.trim().is_empty() {
-                // Contents (file listings) in yellow
-                format!("  {}", line.yellow())
+                format!("  {}", line.bright_yellow())
             } else {
                 format!("  {}", line)
             }
@@ -909,10 +892,8 @@ mod tests {
 
         let command = create_tar_command(false, &tarball, &cwd, targets).unwrap();
 
-        // Command should not use sudo
         assert_eq!(command.get_program(), "tar");
 
-        // Should contain the relative filenames
         let args: Vec<_> = command.get_args().collect();
         let args_str = format!("{:?}", args);
         assert!(args_str.contains("file1.txt"));
@@ -932,7 +913,6 @@ mod tests {
 
         let command = create_tar_command(true, &tarball, &cwd, targets).unwrap();
 
-        // Command should use sudo
         assert_eq!(command.get_program(), "sudo");
 
         let args: Vec<_> = command.get_args().collect();
@@ -945,11 +925,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path();
 
-        // Create a tar.gz file
         let tar_file = temp_path.join("test.tar.gz");
         fs::write(&tar_file, "fake tar content").unwrap();
 
-        // Create a regular file
         let regular_file = temp_path.join("test.txt");
         fs::write(&regular_file, "regular content").unwrap();
 
@@ -960,8 +938,7 @@ mod tests {
     #[test]
     fn test_current_uid() {
         let uid = current_uid();
-        // UID should be a valid value (u32 is always non-negative)
-        assert!(uid > 0 || uid == 0, "UID should be valid"); // Allow 0 for root
+        assert!(uid > 0 || uid == 0, "UID should be valid");
     }
 
     #[test]
@@ -973,7 +950,6 @@ mod tests {
         fs::write(&test_file, "test").unwrap();
 
         let uid = file_uid(&test_file).unwrap();
-        // Should match current user for files we create
         assert_eq!(uid, current_uid(), "File should be owned by current user");
     }
 
@@ -993,7 +969,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path();
 
-        // Create test file and directory
         let test_file = temp_path.join("test.txt");
         let test_dir = temp_path.join("test_dir");
         let test_dir_file = test_dir.join("inner.txt");
@@ -1015,26 +990,20 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path();
 
-        // Create some test directories
         let dir1 = temp_path.join("1234567890");
         let dir2 = temp_path.join("9876543210");
 
         fs::create_dir_all(&dir1).unwrap();
         fs::create_dir_all(&dir2).unwrap();
 
-        // Create metadata files to make them look like real archives
         fs::write(dir1.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
         fs::write(dir2.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
 
-        // Test that cleanup runs without error with a reasonable threshold
         cleanup(temp_path, 30).unwrap();
 
-        // Since we just created the directories, they should still exist
-        // (their modified time is very recent)
         assert!(dir1.exists(), "Recently created directory should still exist");
         assert!(dir2.exists(), "Recently created directory should still exist");
 
-        // Test cleanup with a very long threshold - should definitely keep everything
         cleanup(temp_path, 365).unwrap();
 
         assert!(dir1.exists(), "Directory should exist with long threshold");
@@ -1057,13 +1026,10 @@ mod tests {
         let timestamp = 1234567890123456789u64;
         let targets = vec![test_file.clone()];
 
-        // Archive without removing
         archive(&archive_dir, timestamp, &targets, false, false, None).unwrap();
 
-        // Original file should still exist (remove=false)
         assert!(test_file.exists(), "Original file should still exist");
 
-        // Archive should be created
         let expected_archive = archive_dir.join(timestamp.to_string());
         assert!(expected_archive.exists(), "Archive directory should be created");
 
@@ -1091,13 +1057,10 @@ mod tests {
         let timestamp = 1234567890123456789u64;
         let targets = vec![test_file.clone()];
 
-        // Archive with removing
         archive(&archive_dir, timestamp, &targets, false, true, None).unwrap();
 
-        // Original file should be removed (remove=true)
         assert!(!test_file.exists(), "Original file should be removed");
 
-        // Archive should be created
         let expected_archive = archive_dir.join(timestamp.to_string());
         assert!(expected_archive.exists(), "Archive directory should be created");
     }
@@ -1116,14 +1079,14 @@ mod tests {
     fn test_config_load_from_file() {
         let temp_dir = TempDir::new().unwrap();
         let config_file = temp_dir.path().join("test_config.yml");
-        
+
         let config_content = r#"
 cleanup_days: 45
 auto_cleanup: true
 archive_location: "/tmp/test_archive"
 "#;
         fs::write(&config_file, config_content).unwrap();
-        
+
         let config = Config::load(Some(config_file)).unwrap();
         assert_eq!(config.cleanup_days, 45);
         assert_eq!(config.auto_cleanup, true);
@@ -1134,28 +1097,28 @@ archive_location: "/tmp/test_archive"
     fn test_config_load_partial_file() {
         let temp_dir = TempDir::new().unwrap();
         let config_file = temp_dir.path().join("partial_config.yml");
-        
+
         let config_content = r#"
 cleanup_days: 15
 "#;
         fs::write(&config_file, config_content).unwrap();
-        
+
         let config = Config::load(Some(config_file)).unwrap();
         assert_eq!(config.cleanup_days, 15);
-        assert_eq!(config.auto_cleanup, false); // Should use default
-        assert!(config.archive_location.contains("rkvr/archive")); // Should use default
+        assert_eq!(config.auto_cleanup, false);
+        assert!(config.archive_location.contains("rkvr/archive"));
     }
 
     #[test]
     fn test_config_load_invalid_file() {
         let temp_dir = TempDir::new().unwrap();
         let config_file = temp_dir.path().join("invalid_config.yml");
-        
+
         let config_content = r#"
 invalid_yaml: [unclosed
 "#;
         fs::write(&config_file, config_content).unwrap();
-        
+
         let result = Config::load(Some(config_file));
         assert!(result.is_err(), "Should fail to load invalid YAML");
     }
@@ -1164,9 +1127,8 @@ invalid_yaml: [unclosed
     fn test_config_load_nonexistent_file() {
         let temp_dir = TempDir::new().unwrap();
         let config_file = temp_dir.path().join("nonexistent.yml");
-        
+
         let config = Config::load(Some(config_file)).unwrap();
-        // Should return default config when file doesn't exist
         assert_eq!(config.cleanup_days, 30);
         assert_eq!(config.auto_cleanup, false);
     }
@@ -1175,14 +1137,14 @@ invalid_yaml: [unclosed
     fn test_config_integration_with_main() {
         let temp_dir = TempDir::new().unwrap();
         let config_file = temp_dir.path().join("integration_config.yml");
-        
+
         let config_content = r#"
 cleanup_days: 7
 auto_cleanup: true
 archive_location: "/tmp/integration_test"
 "#;
         fs::write(&config_file, config_content).unwrap();
-        
+
         let config = Config::load(Some(config_file)).unwrap();
         assert_eq!(config.cleanup_days, 7);
         assert_eq!(config.auto_cleanup, true);
