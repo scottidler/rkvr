@@ -589,9 +589,30 @@ fn format_directory(dir_path: &Path) -> Result<String> {
     let mut output = format!("{}", dir_path.display().to_string().blue().bold());
     let metadata_path = dir_path.join("metadata.yml");
     if let Ok(metadata_content) = fs::read_to_string(&metadata_path) {
-        let indented_content: Vec<String> = metadata_content.lines().map(|line| format!("  {}", line.dimmed())).collect();
-        let indented_content_str = indented_content.join("\n");
-        output += &format!("\n{}\n", indented_content_str);
+        let formatted_lines: Vec<String> = metadata_content.lines().map(|line| {
+            if line.starts_with("cwd:") {
+                let parts: Vec<&str> = line.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    format!("  {}: {}", "cwd".bright_white().bold(), parts[1].trim().red())
+                } else {
+                    format!("  {}", line)
+                }
+            } else if line.starts_with("targets:") {
+                format!("  {}", "targets:".bright_white().bold())
+            } else if line.starts_with("contents:") {
+                format!("  {}", "contents:".bright_white().bold())
+            } else if line.starts_with("- ") {
+                // Target file names in red
+                format!("  {}", line.red())
+            } else if line.starts_with("  ") && !line.trim().is_empty() {
+                // Contents (file listings) in yellow
+                format!("  {}", line.yellow())
+            } else {
+                format!("  {}", line)
+            }
+        }).collect();
+        let formatted_content = formatted_lines.join("\n");
+        output += &format!("\n{}\n", formatted_content);
     }
     Ok(output)
 }
