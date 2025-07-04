@@ -12,13 +12,21 @@ use std::time::SystemTime;
 
 // Third-party crate imports
 use atty::Stream;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use configparser::ini::Ini;
 use dirs;
 use eyre::{eyre, Context, Result};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
+use colored::*;
+
+// Local modules
+mod cli;
+mod config;
+
+use cli::{Cli, Action};
+use config::Config;
 
 static EZA_ARGS: &[&str] = &[
     "--tree",
@@ -32,9 +40,7 @@ static EZA_ARGS: &[&str] = &[
     "--ignore-glob=incremental",
 ];
 
-mod built_info {
-    include!(concat!(env!("OUT_DIR"), "/git_describe.rs"));
-}
+
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Metadata {
@@ -58,9 +64,10 @@ fn as_paths(paths: &[String]) -> Vec<PathBuf> {
 }
 
 fn get_log_file_path() -> Result<PathBuf> {
-    let log_dir = dirs::home_dir()
-        .ok_or_else(|| eyre!("Could not determine home directory"))?
-        .join(".local/share/rkvr/logs");
+    let log_dir = dirs::data_local_dir()
+        .ok_or_else(|| eyre!("Could not determine local data directory"))?
+        .join("rkvr")
+        .join("logs");
 
     fs::create_dir_all(&log_dir).wrap_err_with(|| format!("Failed to create log directory: {}", log_dir.display()))?;
 
@@ -78,77 +85,35 @@ fn setup_logging() -> Result<()> {
         return Ok(());
     }
 
-    // Otherwise, use fern for file + console logging
-    fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
+    // Otherwise, use env_logger with file output
+    use std::fs::OpenOptions;
+    use env_logger::Target;
+
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .wrap_err_with(|| format!("Failed to open log file: {}", log_file_path.display()))?;
+
+    env_logger::Builder::from_env(env_logger::Env::default().filter_or("RUST_LOG", "info"))
+        .format(|buf, record| {
+            use std::io::Write;
+            writeln!(buf,
                 "{} [{}] [{}] {}",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
                 record.level(),
                 record.target(),
-                message
-            ))
+                record.args()
+            )
         })
-        .level(log::LevelFilter::Info)
-        .level_for("rkvr", log::LevelFilter::Debug) // More verbose for our own crate
-        .chain(
-            fern::Dispatch::new()
-                .filter(|metadata| metadata.target().starts_with("rkvr"))
-                .chain(fern::log_file(&log_file_path)?),
-        )
-        .apply()
-        .wrap_err("Failed to initialize logging")?;
+        .target(Target::Pipe(Box::new(log_file)))
+        .init();
 
     info!("Logging initialized - file: {}", log_file_path.display());
     Ok(())
 }
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "rkvr",
-    about = "A safe file archival and removal tool",
-    version = built_info::GIT_DESCRIBE,
-    author = "Scott A. Idler <scott.a.idler@gmail.com>",
-    arg_required_else_help = true,
-    after_help = format!("Logs are written to: {}",
-        get_log_file_path().map(|p| p.display().to_string()).unwrap_or_else(|_| "~/.local/share/rkvr/logs/rkvr.log".to_string())
-    )
-)]
-struct Cli {
-    #[arg(name = "targets")]
-    targets: Vec<String>,
 
-    #[command(subcommand)]
-    action: Option<Action>,
-}
-
-#[derive(Parser, Clone, Debug)]
-struct Args {
-    #[arg(name = "targets")]
-    targets: Vec<String>,
-}
-
-#[derive(Subcommand, Clone, Debug)]
-enum Action {
-    #[command(about = "bkup files")]
-    Bkup(Args),
-    #[command(about = "rmrf files [default]")]
-    Rmrf(Args),
-    #[command(about = "recover rmrf|bkup files")]
-    Rcvr(Args),
-    #[command(about = "list bkup files")]
-    LsBkup(Args),
-    #[command(about = "list rmrf files")]
-    LsRmrf(Args),
-    #[command(about = "bkup files and rmrf the local files")]
-    BkupRmrf(Args),
-}
-
-impl Default for Action {
-    fn default() -> Self {
-        Action::Rmrf(Args { targets: vec![] })
-    }
-}
 
 fn current_uid() -> u32 {
     // unsafe call into libc
@@ -621,10 +586,10 @@ fn process_directory(matcher: &SkimMatcherV2, dir: &DirEntry, patterns: &[String
 }
 
 fn format_directory(dir_path: &Path) -> Result<String> {
-    let mut output = format!("{}/", dir_path.display());
+    let mut output = format!("{}", dir_path.display().to_string().blue().bold());
     let metadata_path = dir_path.join("metadata.yml");
     if let Ok(metadata_content) = fs::read_to_string(&metadata_path) {
-        let indented_content: Vec<String> = metadata_content.lines().map(|line| format!("  {}", line)).collect();
+        let indented_content: Vec<String> = metadata_content.lines().map(|line| format!("  {}", line.dimmed())).collect();
         let indented_content_str = indented_content.join("\n");
         output += &format!("\n{}\n", indented_content_str);
     }
@@ -751,6 +716,10 @@ fn main() -> Result<()> {
     let matches = Cli::parse_from(args);
     debug!("CLI arguments parsed: {:?}", matches);
 
+    // Load configuration
+    let config = Config::load(matches.config.clone())?;
+    debug!("Configuration loaded: {:?}", config);
+
     let action: Action = matches.action.clone().unwrap_or_default();
     info!("Action: {:?}", action);
 
@@ -777,7 +746,9 @@ fn main() -> Result<()> {
     let bkup_path = Path::new(&bkup_path);
 
     let sudo: bool = rmrf_cfg.get("DEFAULT", "sudo").unwrap_or("yes".to_owned()) == "yes";
-    let days: i32 = rmrf_cfg.get("DEFAULT", "keep").unwrap_or("21".to_owned()).parse()?;
+    let days: i32 = rmrf_cfg.get("DEFAULT", "keep")
+        .map(|s| s.parse().unwrap_or(config.cleanup_days as i32))
+        .unwrap_or(config.cleanup_days as i32);
     let threshold: i64 = rmrf_cfg
         .get("DEFAULT", "threshold")
         .unwrap_or("70".to_owned())
@@ -1176,5 +1147,90 @@ mod tests {
                 "Metadata should contain correct CWD"
             );
         }
+    }
+
+    #[test]
+    fn test_config_load_default() {
+        let config = Config::load(None).unwrap();
+        assert_eq!(config.cleanup_days, 30);
+        assert_eq!(config.auto_cleanup, false);
+        assert!(config.archive_location.contains("rkvr/archive"));
+    }
+
+    #[test]
+    fn test_config_load_from_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join("test_config.yml");
+        
+        let config_content = r#"
+cleanup_days: 45
+auto_cleanup: true
+archive_location: "/tmp/test_archive"
+"#;
+        fs::write(&config_file, config_content).unwrap();
+        
+        let config = Config::load(Some(config_file)).unwrap();
+        assert_eq!(config.cleanup_days, 45);
+        assert_eq!(config.auto_cleanup, true);
+        assert_eq!(config.archive_location, "/tmp/test_archive");
+    }
+
+    #[test]
+    fn test_config_load_partial_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join("partial_config.yml");
+        
+        let config_content = r#"
+cleanup_days: 15
+"#;
+        fs::write(&config_file, config_content).unwrap();
+        
+        let config = Config::load(Some(config_file)).unwrap();
+        assert_eq!(config.cleanup_days, 15);
+        assert_eq!(config.auto_cleanup, false); // Should use default
+        assert!(config.archive_location.contains("rkvr/archive")); // Should use default
+    }
+
+    #[test]
+    fn test_config_load_invalid_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join("invalid_config.yml");
+        
+        let config_content = r#"
+invalid_yaml: [unclosed
+"#;
+        fs::write(&config_file, config_content).unwrap();
+        
+        let result = Config::load(Some(config_file));
+        assert!(result.is_err(), "Should fail to load invalid YAML");
+    }
+
+    #[test]
+    fn test_config_load_nonexistent_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join("nonexistent.yml");
+        
+        let config = Config::load(Some(config_file)).unwrap();
+        // Should return default config when file doesn't exist
+        assert_eq!(config.cleanup_days, 30);
+        assert_eq!(config.auto_cleanup, false);
+    }
+
+    #[test]
+    fn test_config_integration_with_main() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join("integration_config.yml");
+        
+        let config_content = r#"
+cleanup_days: 7
+auto_cleanup: true
+archive_location: "/tmp/integration_test"
+"#;
+        fs::write(&config_file, config_content).unwrap();
+        
+        let config = Config::load(Some(config_file)).unwrap();
+        assert_eq!(config.cleanup_days, 7);
+        assert_eq!(config.auto_cleanup, true);
+        assert_eq!(config.archive_location, "/tmp/integration_test");
     }
 }

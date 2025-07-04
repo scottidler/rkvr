@@ -1,0 +1,12 @@
+# rkvr configuration file
+# This is a sample configuration file for rkvr
+# Place this file in ~/.config/rkvr/rkvr.yml or in your current directory
+
+# Number of days to keep archived files before cleanup
+cleanup_days: 30
+
+# Whether to automatically cleanup old archives
+auto_cleanup: false
+
+# Location for archive storage (supports ~ expansion)
+archive_location: "~/.local/share/rkvr/archive" 
