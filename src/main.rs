@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::time::SystemTime;
 use std::fs::OpenOptions;
+use which::which;
 
 // Third-party crate imports
 use atty::Stream;
@@ -41,7 +42,6 @@ static EZA_ARGS: &[&str] = &[
     "--ignore-glob=target",
     "--ignore-glob=incremental",
 ];
-
 
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -167,6 +167,21 @@ fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
     Ok(())
 }
 
+fn resolve_eza_path() -> Result<String> {
+    // Only look for eza since we need --tree functionality
+    if let Ok(path) = which("eza") {
+        Ok(path.to_string_lossy().to_string())
+    } else {
+        // As a last resort, try common paths for eza
+        for path in ["/usr/bin/eza", "/usr/local/bin/eza", "/opt/homebrew/bin/eza"] {
+            if std::path::Path::new(path).exists() {
+                return Ok(path.to_string());
+            }
+        }
+        eyre::bail!("Could not find eza command. Please install eza: https://github.com/eza-community/eza")
+    }
+}
+
 fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
     info!(
         "fn create_metadata: base={} cwd={} targets={:?}",
@@ -175,7 +190,8 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
         targets
     );
 
-    let output = Command::new("eza")
+    let eza_tree = resolve_eza_path()?;
+    let output = Command::new(&eza_tree)
         .args(EZA_ARGS)
         .args(targets.iter().map(|t| t.to_str().unwrap()))
         .output()
