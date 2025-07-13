@@ -168,18 +168,29 @@ fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
 }
 
 fn resolve_eza_path() -> Result<String> {
-    // Only look for eza since we need --tree functionality
+    // First try the normal which lookup
     if let Ok(path) = which("eza") {
-        Ok(path.to_string_lossy().to_string())
-    } else {
-        // As a last resort, try common paths for eza
-        for path in ["/usr/bin/eza", "/usr/local/bin/eza", "/opt/homebrew/bin/eza"] {
-            if std::path::Path::new(path).exists() {
-                return Ok(path.to_string());
+        return Ok(path.to_string_lossy().to_string());
+    }
+
+    // If we're running under sudo, try to find eza as the original user
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        // Run 'which eza' as the original user with their login environment
+        let output = Command::new("sudo")
+            .args(&["-u", &sudo_user, "-i", "which", "eza"])
+            .output();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() && std::path::Path::new(&path).exists() {
+                    return Ok(path);
+                }
             }
         }
-        eyre::bail!("Could not find eza command. Please install eza: https://github.com/eza-community/eza")
     }
+
+    eyre::bail!("Could not find eza command. Please install eza: https://github.com/eza-community/eza")
 }
 
 fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
