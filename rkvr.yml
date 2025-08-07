@@ -9,4 +9,4 @@ cleanup_days: 30
 auto_cleanup: false
 
 # Location for archive storage (supports ~ expansion)
-archive_location: "~/.local/share/rkvr/archive" 
+archive_location: "~/.local/share/rkvr/archive"

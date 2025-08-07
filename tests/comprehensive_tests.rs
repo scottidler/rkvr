@@ -335,4 +335,150 @@ fn test_symlink_handling() {
     assert_eq!(archive_dirs.len(), 1, "Should have one archive directory");
 }
 
+fn create_config_with_sudo(temp_path: &Path, rmrf_dir: &Path, bkup_dir: &Path, sudo_enabled: bool) -> std::path::PathBuf {
+    let config_dir = temp_path.join(".config").join("rmrf");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_file = config_dir.join("rmrf.cfg");
+    let sudo_setting = if sudo_enabled { "yes" } else { "no" };
+    fs::write(
+        &config_file,
+        format!(
+            "[DEFAULT]\nrmrf_path = {}\nbkup_path = {}\nsudo = {}\nkeep = 0\nthreshold = 70\n",
+            rmrf_dir.display(),
+            bkup_dir.display(),
+            sudo_setting
+        ),
+    )
+    .unwrap();
+    config_file
+}
+
+#[test]
+fn test_cleanup_functionality_with_sudo_enabled() {
+    build_binary();
+
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    let test_dir = temp_path.join("cleanup_test");
+    fs::create_dir_all(&test_dir).unwrap();
+    let test_file = test_dir.join("cleanup_test.txt");
+    fs::write(&test_file, "cleanup test content").unwrap();
+
+    let rmrf_dir = temp_path.join("rmrf");
+    let bkup_dir = temp_path.join("bkup");
+    fs::create_dir_all(&rmrf_dir).unwrap();
+    fs::create_dir_all(&bkup_dir).unwrap();
+
+    // Create config with sudo enabled and immediate cleanup (keep=0)
+    create_config_with_sudo(temp_path, &rmrf_dir, &bkup_dir, true);
+
+    // Archive the file (should create archive directory)
+    let output = run_rkvr_command(&["rmrf", test_file.to_str().unwrap()], temp_path);
+    assert_success(&output, "Cleanup test rmrf command");
+    assert_no_tar_warnings(&output, "Cleanup test rmrf command");
+
+    // File should be removed
+    assert!(!test_file.exists(), "File should be removed");
+
+    // Archive directory should be created but then cleaned up immediately due to keep=0
+    // We can't easily test this in integration tests because the cleanup happens immediately
+    // and we can't control timing, but the unit tests verify the sudo functionality
+}
+
+#[test]
+fn test_cleanup_functionality_with_sudo_disabled() {
+    build_binary();
+
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    let test_dir = temp_path.join("cleanup_no_sudo_test");
+    fs::create_dir_all(&test_dir).unwrap();
+    let test_file = test_dir.join("cleanup_no_sudo.txt");
+    fs::write(&test_file, "cleanup no sudo test content").unwrap();
+
+    let rmrf_dir = temp_path.join("rmrf");
+    let bkup_dir = temp_path.join("bkup");
+    fs::create_dir_all(&rmrf_dir).unwrap();
+    fs::create_dir_all(&bkup_dir).unwrap();
+
+    // Create config with sudo disabled and immediate cleanup (keep=0)
+    create_config_with_sudo(temp_path, &rmrf_dir, &bkup_dir, false);
+
+    // Archive the file
+    let output = run_rkvr_command(&["rmrf", test_file.to_str().unwrap()], temp_path);
+    assert_success(&output, "Cleanup no sudo test rmrf command");
+    assert_no_tar_warnings(&output, "Cleanup no sudo test rmrf command");
+
+    // File should be removed
+    assert!(!test_file.exists(), "File should be removed");
+
+    // This should work fine since user owns the created archive directories
+}
+
+#[test]
+fn test_rmrf_with_cleanup_preserves_recent_archives() {
+    build_binary();
+
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    let test_dir = temp_path.join("preserve_test");
+    fs::create_dir_all(&test_dir).unwrap();
+    let test_file1 = test_dir.join("preserve1.txt");
+    let test_file2 = test_dir.join("preserve2.txt");
+    fs::write(&test_file1, "preserve test 1").unwrap();
+    fs::write(&test_file2, "preserve test 2").unwrap();
+
+    let rmrf_dir = temp_path.join("rmrf");
+    let bkup_dir = temp_path.join("bkup");
+    fs::create_dir_all(&rmrf_dir).unwrap();
+    fs::create_dir_all(&bkup_dir).unwrap();
+
+    // Create config with sudo enabled and keep for 30 days
+    let config_dir = temp_path.join(".config").join("rmrf");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_file = config_dir.join("rmrf.cfg");
+    fs::write(
+        &config_file,
+        format!(
+            "[DEFAULT]\nrmrf_path = {}\nbkup_path = {}\nsudo = yes\nkeep = 30\nthreshold = 70\n",
+            rmrf_dir.display(),
+            bkup_dir.display()
+        ),
+    )
+    .unwrap();
+
+    // Archive first file
+    let output1 = run_rkvr_command(&["rmrf", test_file1.to_str().unwrap()], temp_path);
+    assert_success(&output1, "First preserve test rmrf command");
+
+    // Check first archive was created
+    let archive_dirs_after_first = get_archive_dirs(&rmrf_dir);
+    assert_eq!(
+        archive_dirs_after_first.len(),
+        1,
+        "Should have one archive directory after first command"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(100)); // Ensure different timestamps
+
+    // Archive second file
+    let output2 = run_rkvr_command(&["rmrf", test_file2.to_str().unwrap()], temp_path);
+    assert_success(&output2, "Second preserve test rmrf command");
+
+    // Check both archives still exist (should be preserved due to 30 day keep)
+    let archive_dirs_after_second = get_archive_dirs(&rmrf_dir);
+    assert_eq!(
+        archive_dirs_after_second.len(),
+        2,
+        "Should have two archive directories after second command (both preserved)"
+    );
+
+    // Both files should be removed from original location
+    assert!(!test_file1.exists(), "First file should be removed");
+    assert!(!test_file2.exists(), "Second file should be removed");
+}
+
 

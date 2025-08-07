@@ -7,17 +7,17 @@ use std::path::PathBuf;
 pub struct Config {
     #[serde(default = "default_cleanup_days")]
     pub cleanup_days: usize,
-    
+
     #[serde(default)]
     pub auto_cleanup: bool,
-    
+
     #[serde(default = "default_archive_location")]
     pub archive_location: String,
 }
 
 fn default_cleanup_days() -> usize { 30 }
 
-fn default_archive_location() -> String { 
+fn default_archive_location() -> String {
     dirs::data_local_dir()
         .map(|d| d.join("rkvr").join("archive"))
         .map(|p| p.display().to_string())
@@ -68,4 +68,4 @@ impl Config {
             .join("rkvr")
             .join("rkvr.yml"))
     }
-} 
+}

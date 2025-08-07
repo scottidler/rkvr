@@ -119,8 +119,55 @@ fn current_uid() -> u32 {
 fn file_uid(path: &Path) -> eyre::Result<u32> {
     Ok(fs::metadata(path)?.uid())
 }
-fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
-    info!("fn cleanup: dir_path={} days={}", dir_path.to_string_lossy(), days);
+
+fn remove_file_with_sudo(path: &Path, sudo: bool) -> Result<()> {
+    if sudo {
+        let owner = fs::metadata(path)?.uid();
+        let need_sudo = owner != current_uid();
+
+        if need_sudo {
+            debug!("Using sudo to remove file: {}", path.to_string_lossy());
+            let status = Command::new("sudo")
+                .args(&["rm", "-f", &path.to_string_lossy()])
+                .status()?;
+
+            if !status.success() {
+                eyre::bail!("Failed to remove file {} with sudo (status {})", path.display(), status);
+            }
+            return Ok(());
+        }
+    }
+
+    // Use regular removal if sudo is not enabled or not needed
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn remove_directory_with_sudo(path: &Path, sudo: bool) -> Result<()> {
+    if sudo {
+        let owner = fs::metadata(path)?.uid();
+        let need_sudo = owner != current_uid();
+
+        if need_sudo {
+            debug!("Using sudo to remove directory: {}", path.to_string_lossy());
+            let status = Command::new("sudo")
+                .args(&["rm", "-rf", &path.to_string_lossy()])
+                .status()?;
+
+            if !status.success() {
+                eyre::bail!("Failed to remove directory {} with sudo (status {})", path.display(), status);
+            }
+            return Ok(());
+        }
+    }
+
+    // Use regular removal if sudo is not enabled or not needed
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+fn cleanup(dir_path: &std::path::Path, days: usize, sudo: bool) -> Result<()> {
+    info!("fn cleanup: dir_path={} days={} sudo={}", dir_path.to_string_lossy(), days, sudo);
 
     let now = SystemTime::now();
     debug!("Current time: {:?}", now);
@@ -153,10 +200,10 @@ fn cleanup(dir_path: &std::path::Path, days: usize) -> Result<()> {
 
                     if metadata.is_dir() {
                         debug!("Removing directory: {}", path.to_string_lossy());
-                        fs::remove_dir_all(&path)?;
+                        remove_directory_with_sudo(&path, sudo)?;
                     } else {
                         debug!("Removing file: {}", path.to_string_lossy());
-                        fs::remove_file(&path)?;
+                        remove_file_with_sudo(&path, sudo)?;
                     }
                 }
             }
@@ -515,7 +562,7 @@ fn archive(
     }
 
     if let Some(days) = keep {
-        cleanup(&path, days as usize)?;
+        cleanup(&path, days as usize, sudo)?;
     }
 
     Ok(())
@@ -1026,12 +1073,12 @@ mod tests {
         fs::write(dir1.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
         fs::write(dir2.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
 
-        cleanup(temp_path, 30).unwrap();
+        cleanup(temp_path, 30, false).unwrap();
 
         assert!(dir1.exists(), "Recently created directory should still exist");
         assert!(dir2.exists(), "Recently created directory should still exist");
 
-        cleanup(temp_path, 365).unwrap();
+        cleanup(temp_path, 365, false).unwrap();
 
         assert!(dir1.exists(), "Directory should exist with long threshold");
         assert!(dir2.exists(), "Directory should exist with long threshold");
@@ -1176,5 +1223,126 @@ archive_location: "/tmp/integration_test"
         assert_eq!(config.cleanup_days, 7);
         assert_eq!(config.auto_cleanup, true);
         assert_eq!(config.archive_location, "/tmp/integration_test");
+    }
+
+    #[test]
+    fn test_cleanup_with_sudo_disabled() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        // Create directories with regular permissions
+        let dir1 = temp_path.join("1234567890");
+        let dir2 = temp_path.join("9876543210");
+
+        fs::create_dir_all(&dir1).unwrap();
+        fs::create_dir_all(&dir2).unwrap();
+
+        fs::write(dir1.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
+        fs::write(dir2.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
+
+        // Test cleanup with sudo=false (should work for user-owned files)
+        cleanup(temp_path, 30, false).unwrap();
+
+        assert!(dir1.exists(), "Recently created directory should still exist");
+        assert!(dir2.exists(), "Recently created directory should still exist");
+
+        // Test cleanup with longer threshold
+        cleanup(temp_path, 365, false).unwrap();
+
+        assert!(dir1.exists(), "Directory should exist with long threshold");
+        assert!(dir2.exists(), "Directory should exist with long threshold");
+    }
+
+    #[test]
+    fn test_cleanup_with_sudo_enabled() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        // Create directories with regular permissions
+        let dir1 = temp_path.join("1234567890");
+        let dir2 = temp_path.join("9876543210");
+
+        fs::create_dir_all(&dir1).unwrap();
+        fs::create_dir_all(&dir2).unwrap();
+
+        fs::write(dir1.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
+        fs::write(dir2.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
+
+        // Test cleanup with sudo=true (should still work for user-owned files)
+        cleanup(temp_path, 30, true).unwrap();
+
+        assert!(dir1.exists(), "Recently created directory should still exist");
+        assert!(dir2.exists(), "Recently created directory should still exist");
+
+        // Test cleanup with longer threshold
+        cleanup(temp_path, 365, true).unwrap();
+
+        assert!(dir1.exists(), "Directory should exist with long threshold");
+        assert!(dir2.exists(), "Directory should exist with long threshold");
+    }
+
+    #[test]
+    fn test_remove_file_with_sudo_user_owned() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        let test_file = temp_path.join("test_file.txt");
+        fs::write(&test_file, "test content").unwrap();
+
+        // Test removing user-owned file with sudo=false
+        remove_file_with_sudo(&test_file, false).unwrap();
+        assert!(!test_file.exists(), "File should be removed");
+
+        // Test removing user-owned file with sudo=true
+        let test_file2 = temp_path.join("test_file2.txt");
+        fs::write(&test_file2, "test content").unwrap();
+        remove_file_with_sudo(&test_file2, true).unwrap();
+        assert!(!test_file2.exists(), "File should be removed");
+    }
+
+    #[test]
+    fn test_remove_directory_with_sudo_user_owned() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        let test_dir = temp_path.join("test_dir");
+        fs::create_dir_all(&test_dir).unwrap();
+        fs::write(test_dir.join("file.txt"), "content").unwrap();
+
+        // Test removing user-owned directory with sudo=false
+        remove_directory_with_sudo(&test_dir, false).unwrap();
+        assert!(!test_dir.exists(), "Directory should be removed");
+
+        // Test removing user-owned directory with sudo=true
+        let test_dir2 = temp_path.join("test_dir2");
+        fs::create_dir_all(&test_dir2).unwrap();
+        fs::write(test_dir2.join("file.txt"), "content").unwrap();
+        remove_directory_with_sudo(&test_dir2, true).unwrap();
+        assert!(!test_dir2.exists(), "Directory should be removed");
+    }
+
+    #[test]
+    fn test_cleanup_old_directories() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        // Create directories
+        let old_dir = temp_path.join("1234567890");
+        let recent_dir = temp_path.join("9876543210");
+
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&recent_dir).unwrap();
+
+        fs::write(old_dir.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
+        fs::write(recent_dir.join("metadata.yml"), "cwd: /tmp\ntargets: []\ncontents: |").unwrap();
+
+        // We can't easily change file timestamps in tests without external tools,
+        // so we'll test the logic by using a very short threshold (0 days)
+        // This should delete all directories
+        cleanup(temp_path, 0, false).unwrap();
+
+        // Both directories should be deleted with 0 day threshold
+        assert!(!old_dir.exists(), "Old directory should be removed");
+        assert!(!recent_dir.exists(), "Directory should be removed with 0 day threshold");
     }
 }
