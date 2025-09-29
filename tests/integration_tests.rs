@@ -191,8 +191,6 @@ fn test_rmrf_no_tar_warnings_for_absolute_paths() {
     }
 }
 
-
-
 #[test]
 fn test_multiple_files_different_directories() {
     build_binary();

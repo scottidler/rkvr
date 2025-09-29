@@ -3,18 +3,19 @@ use libc::getuid;
 use log::{debug, info};
 use std::collections::HashMap;
 use std::env;
+use std::fs::OpenOptions;
 use std::fs::{self, DirEntry, File};
 use std::io::{self, BufWriter, ErrorKind, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::time::SystemTime;
-use std::fs::OpenOptions;
 use which::which;
 
 // Third-party crate imports
 use atty::Stream;
 use clap::Parser;
+use colored::*;
 use configparser::ini::Ini;
 use dirs;
 use env_logger::Target;
@@ -22,13 +23,12 @@ use eyre::{eyre, Context, Result};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
-use colored::*;
 
 // Local modules
 mod cli;
 mod config;
 
-use cli::{Cli, Action};
+use cli::{Action, Cli};
 use config::Config;
 
 static EZA_ARGS: &[&str] = &[
@@ -42,7 +42,6 @@ static EZA_ARGS: &[&str] = &[
     "--ignore-glob=target",
     "--ignore-glob=incremental",
 ];
-
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Metadata {
@@ -95,7 +94,8 @@ fn setup_logging() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().filter_or("RUST_LOG", "info"))
         .format(|buf, record| {
             use std::io::Write;
-            writeln!(buf,
+            writeln!(
+                buf,
                 "{} [{}] [{}] {}",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
                 record.level(),
@@ -109,8 +109,6 @@ fn setup_logging() -> Result<()> {
     info!("Logging initialized - file: {}", log_file_path.display());
     Ok(())
 }
-
-
 
 fn current_uid() -> u32 {
     unsafe { getuid() as u32 }
@@ -155,7 +153,11 @@ fn remove_directory_with_sudo(path: &Path, sudo: bool) -> Result<()> {
                 .status()?;
 
             if !status.success() {
-                eyre::bail!("Failed to remove directory {} with sudo (status {})", path.display(), status);
+                eyre::bail!(
+                    "Failed to remove directory {} with sudo (status {})",
+                    path.display(),
+                    status
+                );
             }
             return Ok(());
         }
@@ -167,7 +169,12 @@ fn remove_directory_with_sudo(path: &Path, sudo: bool) -> Result<()> {
 }
 
 fn cleanup(dir_path: &std::path::Path, days: usize, sudo: bool) -> Result<()> {
-    info!("fn cleanup: dir_path={} days={} sudo={}", dir_path.to_string_lossy(), days, sudo);
+    info!(
+        "fn cleanup: dir_path={} days={} sudo={}",
+        dir_path.to_string_lossy(),
+        days,
+        sudo
+    );
 
     let now = SystemTime::now();
     debug!("Current time: {:?}", now);
@@ -648,26 +655,29 @@ fn format_directory(dir_path: &Path) -> Result<String> {
     let mut output = format!("{}", dir_path.display().to_string().bright_blue().bold());
     let metadata_path = dir_path.join("metadata.yml");
     if let Ok(metadata_content) = fs::read_to_string(&metadata_path) {
-        let formatted_lines: Vec<String> = metadata_content.lines().map(|line| {
-            if line.starts_with("cwd:") {
-                let parts: Vec<&str> = line.splitn(2, ':').collect();
-                if parts.len() == 2 {
-                    format!("  {}: {}", "cwd".white(), parts[1].trim().bright_red())
+        let formatted_lines: Vec<String> = metadata_content
+            .lines()
+            .map(|line| {
+                if line.starts_with("cwd:") {
+                    let parts: Vec<&str> = line.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        format!("  {}: {}", "cwd".white(), parts[1].trim().bright_red())
+                    } else {
+                        format!("  {}", line)
+                    }
+                } else if line.starts_with("targets:") {
+                    format!("  {}", "targets:".white())
+                } else if line.starts_with("contents:") {
+                    format!("  {}", "contents:".white())
+                } else if line.starts_with("- ") {
+                    format!("  {}", line.bright_red())
+                } else if line.starts_with("  ") && !line.trim().is_empty() {
+                    format!("  {}", line.bright_yellow())
                 } else {
                     format!("  {}", line)
                 }
-            } else if line.starts_with("targets:") {
-                format!("  {}", "targets:".white())
-            } else if line.starts_with("contents:") {
-                format!("  {}", "contents:".white())
-            } else if line.starts_with("- ") {
-                format!("  {}", line.bright_red())
-            } else if line.starts_with("  ") && !line.trim().is_empty() {
-                format!("  {}", line.bright_yellow())
-            } else {
-                format!("  {}", line)
-            }
-        }).collect();
+            })
+            .collect();
         let formatted_content = formatted_lines.join("\n");
         output += &format!("\n{}\n", formatted_content);
     }
@@ -824,7 +834,8 @@ fn main() -> Result<()> {
     let bkup_path = Path::new(&bkup_path);
 
     let sudo: bool = rmrf_cfg.get("DEFAULT", "sudo").unwrap_or("yes".to_owned()) == "yes";
-    let days: i32 = rmrf_cfg.get("DEFAULT", "keep")
+    let days: i32 = rmrf_cfg
+        .get("DEFAULT", "keep")
         .map(|s| s.parse().unwrap_or(config.cleanup_days as i32))
         .unwrap_or(config.cleanup_days as i32);
     let threshold: i64 = rmrf_cfg
@@ -903,8 +914,6 @@ mod tests {
         assert_eq!(groups.len(), 1, "Should have one group");
         assert_eq!(groups[0].len(), 2, "Group should contain both files");
     }
-
-
 
     #[test]
     fn test_categorize_paths_mixed_files_and_directories() {
@@ -1138,8 +1147,6 @@ mod tests {
         let expected_archive = archive_dir.join(timestamp.to_string());
         assert!(expected_archive.exists(), "Archive directory should be created");
     }
-
-
 
     #[test]
     fn test_config_load_default() {

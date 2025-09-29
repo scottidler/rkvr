@@ -15,7 +15,9 @@ pub struct Config {
     pub archive_location: String,
 }
 
-fn default_cleanup_days() -> usize { 30 }
+fn default_cleanup_days() -> usize {
+    30
+}
 
 fn default_archive_location() -> String {
     dirs::data_local_dir()

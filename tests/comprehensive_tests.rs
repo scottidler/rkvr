@@ -85,8 +85,6 @@ fn read_metadata(archive_dir: &Path) -> String {
     fs::read_to_string(&metadata_file).unwrap()
 }
 
-
-
 #[test]
 fn test_bkup_rmrf_command() {
     build_binary();
@@ -245,14 +243,6 @@ fn test_list_bkup_functionality() {
     );
 }
 
-
-
-
-
-
-
-
-
 #[test]
 fn test_default_rmrf_behavior() {
     build_binary();
@@ -335,7 +325,12 @@ fn test_symlink_handling() {
     assert_eq!(archive_dirs.len(), 1, "Should have one archive directory");
 }
 
-fn create_config_with_sudo(temp_path: &Path, rmrf_dir: &Path, bkup_dir: &Path, sudo_enabled: bool) -> std::path::PathBuf {
+fn create_config_with_sudo(
+    temp_path: &Path,
+    rmrf_dir: &Path,
+    bkup_dir: &Path,
+    sudo_enabled: bool,
+) -> std::path::PathBuf {
     let config_dir = temp_path.join(".config").join("rmrf");
     fs::create_dir_all(&config_dir).unwrap();
     let config_file = config_dir.join("rmrf.cfg");
@@ -480,5 +475,3 @@ fn test_rmrf_with_cleanup_preserves_recent_archives() {
     assert!(!test_file1.exists(), "First file should be removed");
     assert!(!test_file2.exists(), "Second file should be removed");
 }
-
-
