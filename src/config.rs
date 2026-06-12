@@ -3,6 +3,33 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// XDG config dir, honoring `$XDG_CONFIG_HOME` and falling back to `$HOME/.config`.
+pub fn xdg_config_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".config"))
+}
+
+/// XDG data dir, honoring `$XDG_DATA_HOME` and falling back to `$HOME/.local/share`.
+///
+/// We deliberately do NOT use the `dirs` config/data helpers: those honor
+/// `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` only on Linux. On macOS they resolve via system
+/// APIs and return `~/Library/...`, ignoring the env vars. These helpers resolve to the
+/// same XDG layout on every platform.
+pub fn xdg_data_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".local").join("share"))
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "default_cleanup_days")]
@@ -20,7 +47,7 @@ fn default_cleanup_days() -> usize {
 }
 
 fn default_archive_location() -> String {
-    dirs::data_local_dir()
+    xdg_data_dir()
         .map(|d| d.join("rkvr").join("archive"))
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.local/share/rkvr/archive".to_string())
@@ -54,7 +81,7 @@ impl Config {
 
     fn find_config_file() -> Result<PathBuf> {
         let candidates = vec![
-            dirs::config_dir().map(|d| d.join("rkvr").join("rkvr.yml")),
+            xdg_config_dir().map(|d| d.join("rkvr").join("rkvr.yml")),
             Some(PathBuf::from("./rkvr.yml")),
         ];
 
@@ -65,7 +92,7 @@ impl Config {
         }
 
         // Return primary location even if it doesn't exist
-        Ok(dirs::config_dir()
+        Ok(xdg_config_dir()
             .ok_or_else(|| eyre::eyre!("Could not determine config directory"))?
             .join("rkvr")
             .join("rkvr.yml"))

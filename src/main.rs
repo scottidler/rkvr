@@ -65,7 +65,7 @@ fn as_paths(paths: &[String]) -> Vec<PathBuf> {
 }
 
 fn get_log_file_path() -> Result<PathBuf> {
-    let log_dir = dirs::data_local_dir()
+    let log_dir = config::xdg_data_dir()
         .ok_or_else(|| eyre!("Could not determine local data directory"))?
         .join("rkvr")
         .join("logs");

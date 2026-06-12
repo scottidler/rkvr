@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 // Function to get log file path for help text
 fn get_log_file_path_for_help() -> String {
-    dirs::data_local_dir()
+    crate::config::xdg_data_dir()
         .map(|d| d.join("rkvr").join("logs").join("rkvr.log"))
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.local/share/rkvr/logs/rkvr.log".to_string())
