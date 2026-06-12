@@ -5,7 +5,7 @@ use tempfile::TempDir;
 
 fn build_binary() {
     let build_output = Command::new("cargo")
-        .args(&["build"])
+        .args(["build"])
         .output()
         .expect("Failed to build project");
 
@@ -38,7 +38,7 @@ fn create_config(temp_path: &Path, rmrf_dir: &Path, bkup_dir: &Path) -> std::pat
 }
 
 fn run_rkvr_command(args: &[&str], home_dir: &Path) -> std::process::Output {
-    Command::new(&get_binary_path())
+    Command::new(get_binary_path())
         .args(args)
         .env("HOME", home_dir)
         .output()

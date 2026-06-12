@@ -17,7 +17,6 @@ use atty::Stream;
 use clap::Parser;
 use colored::*;
 use configparser::ini::Ini;
-use dirs;
 use env_logger::Target;
 use eyre::{eyre, Context, Result};
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -55,8 +54,8 @@ fn as_paths(paths: &[String]) -> Vec<PathBuf> {
     paths
         .iter()
         .map(|p| {
-            if p.starts_with("~/") {
-                dirs::home_dir().unwrap_or_default().join(&p[2..])
+            if let Some(rest) = p.strip_prefix("~/") {
+                dirs::home_dir().unwrap_or_default().join(rest)
             } else {
                 PathBuf::from(p)
             }
@@ -126,7 +125,7 @@ fn remove_file_with_sudo(path: &Path, sudo: bool) -> Result<()> {
         if need_sudo {
             debug!("Using sudo to remove file: {}", path.to_string_lossy());
             let status = Command::new("sudo")
-                .args(&["rm", "-f", &path.to_string_lossy()])
+                .args(["rm", "-f", &path.to_string_lossy()])
                 .status()?;
 
             if !status.success() {
@@ -149,7 +148,7 @@ fn remove_directory_with_sudo(path: &Path, sudo: bool) -> Result<()> {
         if need_sudo {
             debug!("Using sudo to remove directory: {}", path.to_string_lossy());
             let status = Command::new("sudo")
-                .args(&["rm", "-rf", &path.to_string_lossy()])
+                .args(["rm", "-rf", &path.to_string_lossy()])
                 .status()?;
 
             if !status.success() {
@@ -185,33 +184,31 @@ fn cleanup(dir_path: &std::path::Path, days: usize, sudo: bool) -> Result<()> {
     let entries = fs::read_dir(dir_path)?;
     debug!("Directory entries read: entries={:?}", entries);
 
-    for entry in entries {
-        if let Ok(entry) = entry {
-            let path = entry.path();
-            debug!("Checking path: {}", path.to_string_lossy());
+    for entry in entries.flatten() {
+        let path = entry.path();
+        debug!("Checking path: {}", path.to_string_lossy());
 
-            let metadata = fs::metadata(&path)?;
-            debug!("Metadata retrieved");
+        let metadata = fs::metadata(&path)?;
+        debug!("Metadata retrieved");
 
-            let modified_time = metadata.modified()?;
-            debug!("Modified time: {:?}", modified_time);
+        let modified_time = metadata.modified()?;
+        debug!("Modified time: {:?}", modified_time);
 
-            if let Ok(duration_since_modified) = now.duration_since(modified_time) {
-                debug!(
-                    "Duration since modified: {:?}, Delete threshold: {:?}",
-                    duration_since_modified, delete_threshold
-                );
+        if let Ok(duration_since_modified) = now.duration_since(modified_time) {
+            debug!(
+                "Duration since modified: {:?}, Delete threshold: {:?}",
+                duration_since_modified, delete_threshold
+            );
 
-                if duration_since_modified > delete_threshold {
-                    info!("Deleting path: {}", path.to_string_lossy());
+            if duration_since_modified > delete_threshold {
+                info!("Deleting path: {}", path.to_string_lossy());
 
-                    if metadata.is_dir() {
-                        debug!("Removing directory: {}", path.to_string_lossy());
-                        remove_directory_with_sudo(&path, sudo)?;
-                    } else {
-                        debug!("Removing file: {}", path.to_string_lossy());
-                        remove_file_with_sudo(&path, sudo)?;
-                    }
+                if metadata.is_dir() {
+                    debug!("Removing directory: {}", path.to_string_lossy());
+                    remove_directory_with_sudo(&path, sudo)?;
+                } else {
+                    debug!("Removing file: {}", path.to_string_lossy());
+                    remove_file_with_sudo(&path, sudo)?;
                 }
             }
         }
@@ -231,7 +228,7 @@ fn resolve_eza_path() -> Result<String> {
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         // Run 'which eza' as the original user with their login environment
         let output = Command::new("sudo")
-            .args(&["-u", &sudo_user, "-i", "which", "eza"])
+            .args(["-u", &sudo_user, "-i", "which", "eza"])
             .output();
 
         if let Ok(output) = output {
@@ -309,7 +306,7 @@ fn create_tar_command(sudo: bool, tarball_path: &Path, cwd: &Path, targets: Vec<
 
     if sudo {
         let mut cmd = Command::new("sudo");
-        cmd.args(&[
+        cmd.args([
             "tar",
             "-czf",
             tarball_path.to_str().unwrap(),
@@ -320,7 +317,7 @@ fn create_tar_command(sudo: bool, tarball_path: &Path, cwd: &Path, targets: Vec<
         Ok(cmd)
     } else {
         let mut cmd = Command::new("tar");
-        cmd.args(&["-czf", tarball_path.to_str().unwrap(), "-C", cwd.to_str().unwrap()]);
+        cmd.args(["-czf", tarball_path.to_str().unwrap(), "-C", cwd.to_str().unwrap()]);
         cmd.args(&relative_targets);
         Ok(cmd)
     }
@@ -389,7 +386,7 @@ fn copy_files(base: &Path, loose: &[PathBuf], sudo: bool) -> Result<()> {
                 );
             }
             let status = Command::new("sudo")
-                .args(&["cp", "-a", src.to_str().unwrap(), dest.to_str().unwrap()])
+                .args(["cp", "-a", src.to_str().unwrap(), dest.to_str().unwrap()])
                 .status()?;
             if !status.success() {
                 eyre::bail!("`sudo cp -a` failed with status {}", status);
@@ -492,10 +489,7 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
                 .map(|p| cwd_canonical.join(p))
                 .unwrap_or_else(|| canonical_path.parent().unwrap().to_path_buf());
 
-            file_groups_map
-                .entry(group_key)
-                .or_insert_with(Vec::new)
-                .push(canonical_path);
+            file_groups_map.entry(group_key).or_default().push(canonical_path);
         }
     }
 
@@ -557,7 +551,7 @@ fn archive(
         fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
 
         let dir_cwd = directory.parent().unwrap_or(&current_cwd);
-        create_metadata(&base, dir_cwd, &[directory.clone()])?;
+        create_metadata(&base, dir_cwd, std::slice::from_ref(directory))?;
         archive_directory(&base, directory, sudo, dir_cwd)?;
 
         println!("{}", directory.display());
@@ -569,7 +563,7 @@ fn archive(
     }
 
     if let Some(days) = keep {
-        cleanup(&path, days as usize, sudo)?;
+        cleanup(path, days as usize, sudo)?;
     }
 
     Ok(())
@@ -594,7 +588,7 @@ where
         let mut writer = BufWriter::new(stdin);
         if let Err(e) = write_content(&mut writer) {
             if e.downcast_ref::<io::Error>()
-                .map_or(true, |io_err| io_err.kind() != io::ErrorKind::BrokenPipe)
+                .is_none_or(|io_err| io_err.kind() != io::ErrorKind::BrokenPipe)
             {
                 return Err(e);
             }
@@ -608,7 +602,7 @@ where
 fn process_pattern(
     matcher: &SkimMatcherV2,
     dir_name: &str,
-    full_path: &PathBuf,
+    full_path: &Path,
     pattern: &str,
     threshold: i64,
 ) -> Result<bool> {
@@ -693,17 +687,15 @@ fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<()> {
         .filter(|entry| entry.path().is_dir())
         .collect();
 
-    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    dirs.sort_by_key(|a| std::cmp::Reverse(a.file_name()));
 
     if atty::is(Stream::Stdout) {
         use_pager(|writer: &mut BufWriter<ChildStdin>| -> Result<()> {
             for dir in dirs.iter() {
                 if patterns.is_empty()
-                    || process_directory(&matcher, dir, &patterns, threshold)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                    || process_directory(&matcher, dir, patterns, threshold).map_err(io::Error::other)?
                 {
-                    let dir_output =
-                        format_directory(&dir.path()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    let dir_output = format_directory(&dir.path()).map_err(io::Error::other)?;
                     writer.write_all(dir_output.as_bytes())?;
                     writer.write_all(b"\n")?;
                 }
@@ -712,7 +704,7 @@ fn list(dir_path: &Path, patterns: &[String], threshold: i64) -> Result<()> {
         })?;
     } else {
         for dir in dirs.iter() {
-            if patterns.is_empty() || process_directory(&matcher, dir, &patterns, threshold)? {
+            if patterns.is_empty() || process_directory(&matcher, dir, patterns, threshold)? {
                 let dir_output = format_directory(&dir.path())?;
                 println!("{}", dir_output);
             }
@@ -734,7 +726,7 @@ fn extract_bundle(bundle: &Path, restore_to: &Path, sudo: bool) -> Result<()> {
             );
         }
         Command::new("sudo")
-            .args(&[
+            .args([
                 "tar",
                 "xpf",
                 bundle.to_str().unwrap(),
@@ -745,7 +737,7 @@ fn extract_bundle(bundle: &Path, restore_to: &Path, sudo: bool) -> Result<()> {
             .status()?
     } else {
         Command::new("tar")
-            .args(&["xzf", bundle.to_str().unwrap(), "-C", restore_to.to_str().unwrap()])
+            .args(["xzf", bundle.to_str().unwrap(), "-C", restore_to.to_str().unwrap()])
             .status()?
     };
 
@@ -848,34 +840,34 @@ fn main() -> Result<()> {
         rmrf_path, bkup_path, sudo, days, threshold,
     );
 
-    fs::create_dir_all(&rmrf_path)?;
-    fs::create_dir_all(&bkup_path)?;
+    fs::create_dir_all(rmrf_path)?;
+    fs::create_dir_all(bkup_path)?;
     info!("Directories created or verified: {:?}, {:?}", rmrf_path, bkup_path);
 
     match &matches.action {
         Some(action) => match action {
             Action::Bkup(args) => {
-                archive(&bkup_path, timestamp, &as_paths(&args.targets), sudo, false, None)?;
+                archive(bkup_path, timestamp, &as_paths(&args.targets), sudo, false, None)?;
             }
             Action::Rmrf(args) => {
-                archive(&rmrf_path, timestamp, &as_paths(&args.targets), sudo, true, Some(days))?;
+                archive(rmrf_path, timestamp, &as_paths(&args.targets), sudo, true, Some(days))?;
             }
             Action::Rcvr(args) => {
-                recover(&rmrf_path, &as_paths(&args.targets), sudo)?;
+                recover(rmrf_path, &as_paths(&args.targets), sudo)?;
             }
             Action::LsBkup(args) => {
-                list(&bkup_path, &args.targets, threshold)?;
+                list(bkup_path, &args.targets, threshold)?;
             }
             Action::LsRmrf(args) => {
-                list(&rmrf_path, &args.targets, threshold)?;
+                list(rmrf_path, &args.targets, threshold)?;
             }
             Action::BkupRmrf(args) => {
-                archive(&bkup_path, timestamp, &as_paths(&args.targets), sudo, true, None)?;
+                archive(bkup_path, timestamp, &as_paths(&args.targets), sudo, true, None)?;
             }
         },
         None => {
             archive(
-                &rmrf_path,
+                rmrf_path,
                 timestamp,
                 &as_paths(&matches.targets),
                 sudo,
@@ -1019,9 +1011,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::absurd_extreme_comparisons, unused_comparisons)]
     fn test_current_uid() {
         let uid = current_uid();
-        assert!(uid > 0 || uid == 0, "UID should be valid");
+        assert!(uid >= 0, "UID should be valid");
     }
 
     #[test]
@@ -1152,7 +1145,7 @@ mod tests {
     fn test_config_load_default() {
         let config = Config::load(None).unwrap();
         assert_eq!(config.cleanup_days, 30);
-        assert_eq!(config.auto_cleanup, false);
+        assert!(!config.auto_cleanup);
         assert!(config.archive_location.contains("rkvr/archive"));
     }
 
@@ -1170,7 +1163,7 @@ archive_location: "/tmp/test_archive"
 
         let config = Config::load(Some(config_file)).unwrap();
         assert_eq!(config.cleanup_days, 45);
-        assert_eq!(config.auto_cleanup, true);
+        assert!(config.auto_cleanup);
         assert_eq!(config.archive_location, "/tmp/test_archive");
     }
 
@@ -1186,7 +1179,7 @@ cleanup_days: 15
 
         let config = Config::load(Some(config_file)).unwrap();
         assert_eq!(config.cleanup_days, 15);
-        assert_eq!(config.auto_cleanup, false);
+        assert!(!config.auto_cleanup);
         assert!(config.archive_location.contains("rkvr/archive"));
     }
 
@@ -1211,7 +1204,7 @@ invalid_yaml: [unclosed
 
         let config = Config::load(Some(config_file)).unwrap();
         assert_eq!(config.cleanup_days, 30);
-        assert_eq!(config.auto_cleanup, false);
+        assert!(!config.auto_cleanup);
     }
 
     #[test]
@@ -1228,7 +1221,7 @@ archive_location: "/tmp/integration_test"
 
         let config = Config::load(Some(config_file)).unwrap();
         assert_eq!(config.cleanup_days, 7);
-        assert_eq!(config.auto_cleanup, true);
+        assert!(config.auto_cleanup);
         assert_eq!(config.archive_location, "/tmp/integration_test");
     }
 
