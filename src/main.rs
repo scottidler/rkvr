@@ -512,21 +512,47 @@ fn remove_targets(targets: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// Return the next free `<timestamp>-<NNN>` bundle directory under `path`,
+/// advancing `index` past any names already taken. This keeps bundle names
+/// unique both within one invocation and across two invocations that land in
+/// the same second, while preserving chronological string sorting.
+fn next_bundle_dir(path: &Path, timestamp: &str, index: &mut usize) -> PathBuf {
+    loop {
+        let candidate = path.join(format!("{timestamp}-{:03}", *index));
+        *index += 1;
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+}
+
 fn archive(
     path: &Path,
-    timestamp: u64,
+    timestamp: &str,
     targets: &[PathBuf],
     sudo: bool,
     remove: bool,
     keep: Option<i32>,
 ) -> Result<()> {
+    debug!(
+        "fn archive: path={} timestamp={} targets={:?} sudo={} remove={} keep={:?}",
+        path.display(),
+        timestamp,
+        targets,
+        sudo,
+        remove,
+        keep,
+    );
     let current_cwd = env::current_dir().wrap_err("Failed to get current directory")?;
     let (directories, groups) = categorize_paths(targets, &current_cwd)?;
 
-    for (group_index, group) in groups.iter().enumerate() {
+    // Each bundle gets the shared timestamp plus a zero-padded index, so names
+    // stay unique within one invocation and still sort chronologically as strings.
+    let mut bundle_index: usize = 0;
+
+    for group in groups.iter() {
         if !group.is_empty() {
-            let group_timestamp = timestamp + (group_index as u64 * 1000);
-            let base = path.join(group_timestamp.to_string());
+            let base = next_bundle_dir(path, timestamp, &mut bundle_index);
             fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
 
             let group_cwd = if let Some(first_file) = group.first() {
@@ -545,9 +571,8 @@ fn archive(
         }
     }
 
-    for (dir_index, directory) in directories.iter().enumerate() {
-        let dir_timestamp = timestamp + 10000 + (dir_index as u64 * 1000);
-        let base = path.join(dir_timestamp.to_string());
+    for directory in directories.iter() {
+        let base = next_bundle_dir(path, timestamp, &mut bundle_index);
         fs::create_dir_all(&base).wrap_err("Failed to create base directory")?;
 
         let dir_cwd = directory.parent().unwrap_or(&current_cwd);
@@ -790,7 +815,9 @@ fn main() -> Result<()> {
     let current_level = log::max_level();
     debug!("Current log level: {:?}", current_level);
 
-    let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos() as u64;
+    // ISO 8601 (RFC 3339) basic form with hyphenated time: colon-free so the
+    // directory name is safe on every filesystem (Windows/macOS included).
+    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
     debug!("Current timestamp: {}", timestamp);
 
     let matches = Cli::parse_from(args);
@@ -847,10 +874,10 @@ fn main() -> Result<()> {
     match &matches.action {
         Some(action) => match action {
             Action::Bkup(args) => {
-                archive(bkup_path, timestamp, &as_paths(&args.targets), sudo, false, None)?;
+                archive(bkup_path, &timestamp, &as_paths(&args.targets), sudo, false, None)?;
             }
             Action::Rmrf(args) => {
-                archive(rmrf_path, timestamp, &as_paths(&args.targets), sudo, true, Some(days))?;
+                archive(rmrf_path, &timestamp, &as_paths(&args.targets), sudo, true, Some(days))?;
             }
             Action::Rcvr(args) => {
                 recover(rmrf_path, &as_paths(&args.targets), sudo)?;
@@ -862,13 +889,13 @@ fn main() -> Result<()> {
                 list(rmrf_path, &args.targets, threshold)?;
             }
             Action::BkupRmrf(args) => {
-                archive(bkup_path, timestamp, &as_paths(&args.targets), sudo, true, None)?;
+                archive(bkup_path, &timestamp, &as_paths(&args.targets), sudo, true, None)?;
             }
         },
         None => {
             archive(
                 rmrf_path,
-                timestamp,
+                &timestamp,
                 &as_paths(&matches.targets),
                 sudo,
                 true,
@@ -1099,14 +1126,14 @@ mod tests {
         let test_file = source_dir.join("test.txt");
         fs::write(&test_file, "test content").unwrap();
 
-        let timestamp = 1234567890123456789u64;
+        let timestamp = "2026-06-14T15-30-45";
         let targets = vec![test_file.clone()];
 
         archive(&archive_dir, timestamp, &targets, false, false, None).unwrap();
 
         assert!(test_file.exists(), "Original file should still exist");
 
-        let expected_archive = archive_dir.join(timestamp.to_string());
+        let expected_archive = archive_dir.join(format!("{timestamp}-000"));
         assert!(expected_archive.exists(), "Archive directory should be created");
 
         let metadata_file = expected_archive.join("metadata.yml");
@@ -1130,14 +1157,14 @@ mod tests {
         let test_file = source_dir.join("test.txt");
         fs::write(&test_file, "test content").unwrap();
 
-        let timestamp = 1234567890123456789u64;
+        let timestamp = "2026-06-14T15-30-45";
         let targets = vec![test_file.clone()];
 
         archive(&archive_dir, timestamp, &targets, false, true, None).unwrap();
 
         assert!(!test_file.exists(), "Original file should be removed");
 
-        let expected_archive = archive_dir.join(timestamp.to_string());
+        let expected_archive = archive_dir.join(format!("{timestamp}-000"));
         assert!(expected_archive.exists(), "Archive directory should be created");
     }
 
