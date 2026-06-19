@@ -815,9 +815,10 @@ fn main() -> Result<()> {
     let current_level = log::max_level();
     debug!("Current log level: {:?}", current_level);
 
-    // ISO 8601 (RFC 3339) basic form with hyphenated time: colon-free so the
-    // directory name is safe on every filesystem (Windows/macOS included).
-    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+    // YYYY-MM-DD-HHMMSS: colon-free so the directory name is safe on every
+    // filesystem (Windows/macOS included). Same-second collisions are resolved
+    // by the `-NNN` bundle suffix (see next_bundle_dir).
+    let timestamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
     debug!("Current timestamp: {}", timestamp);
 
     let matches = Cli::parse_from(args);
@@ -1126,7 +1127,7 @@ mod tests {
         let test_file = source_dir.join("test.txt");
         fs::write(&test_file, "test content").unwrap();
 
-        let timestamp = "2026-06-14T15-30-45";
+        let timestamp = "2026-06-14-153045";
         let targets = vec![test_file.clone()];
 
         archive(&archive_dir, timestamp, &targets, false, false, None).unwrap();
@@ -1157,7 +1158,7 @@ mod tests {
         let test_file = source_dir.join("test.txt");
         fs::write(&test_file, "test content").unwrap();
 
-        let timestamp = "2026-06-14T15-30-45";
+        let timestamp = "2026-06-14-153045";
         let targets = vec![test_file.clone()];
 
         archive(&archive_dir, timestamp, &targets, false, true, None).unwrap();
