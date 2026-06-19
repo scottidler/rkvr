@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Migrate legacy rkvr/bkup timestamp directories to YYYY-MM-DD-HHMMSS-NNN.
+
+rkvr has used three timestamp-directory schemes over its lifetime:
+
+  EPOCH    pure digits, an epoch count whose precision is implied by length:
+           10 digits = seconds, 13 = millis, 16 = micros, 19 = nanos
+  ISO-T    YYYY-MM-DDTHH-MM-SS-NNN   (the colon-free ISO 8601 basic form)
+  NEW      YYYY-MM-DD-HHMMSS-NNN     (current; the 'T' and time hyphens dropped)
+
+This script renames every EPOCH and ISO-T directory under the rmrf and bkup
+archive spaces to the NEW form, preserving chronological order via a per-second
+-NNN index (the same suffix next_bundle_dir uses at runtime).
+
+The timestamp is encoded ONLY in the directory name -- metadata.yml stores cwd,
+targets, and an eza tree, never the timestamp -- so a rename is sufficient and
+loses nothing. The script verifies this per directory before renaming (it skips
+any directory whose own name appears inside one of its files) so a future scheme
+that did embed the name can never be silently corrupted.
+
+Dry-run by default; pass --apply to perform the renames.
+"""
+
+import argparse
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+RMRF_CFG = Path.home() / ".config" / "rmrf" / "rmrf.cfg"
+DEFAULT_RMRF = Path("/var/tmp/rmrf")
+DEFAULT_BKUP = Path("/var/tmp/bkup")
+
+NEW_FMT = "%Y-%m-%d-%H%M%S"
+
+ISO_T = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})$")
+NEW = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-\d{3}$")
+EPOCH = re.compile(r"^\d+$")
+
+
+def read_paths():
+    """Resolve rmrf_path/bkup_path from rmrf.cfg, falling back to defaults."""
+    rmrf, bkup = DEFAULT_RMRF, DEFAULT_BKUP
+    if RMRF_CFG.is_file():
+        for line in RMRF_CFG.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("rmrf_path="):
+                rmrf = Path(line.split("=", 1)[1].strip())
+            elif line.startswith("bkup_path="):
+                bkup = Path(line.split("=", 1)[1].strip())
+    return rmrf, bkup
+
+
+def base_and_sortkey(name):
+    """Return (new_base, epoch_seconds) for a legacy name, or (None, None).
+
+    new_base is the YYYY-MM-DD-HHMMSS string (no index). epoch_seconds is a
+    float used only to order directories chronologically before indexing.
+    """
+    m = ISO_T.match(name)
+    if m:
+        y, mo, d, h, mi, s, _idx = m.groups()
+        dt = datetime(int(y), int(mo), int(d), int(h), int(mi), int(s))
+        return dt.strftime(NEW_FMT), dt.timestamp()
+
+    if EPOCH.match(name):
+        scale = len(name) - 10  # 0=s, 3=ms, 6=us, 9=ns
+        if scale not in (0, 3, 6, 9):
+            return None, None
+        seconds = int(name) / (10 ** scale)
+        dt = datetime.fromtimestamp(seconds)
+        return dt.strftime(NEW_FMT), seconds
+
+    return None, None
+
+
+def name_is_embedded(dir_path, name):
+    """True if the directory's own name appears verbatim inside any of its files."""
+    for child in dir_path.rglob("*"):
+        if not child.is_file():
+            continue
+        try:
+            data = child.read_bytes()
+        except OSError:
+            return True  # unreadable -> be conservative, treat as embedded
+        if name.encode() in data:
+            return True
+    return False
+
+
+def plan_space(space):
+    """Build an ordered list of (src_name, dst_name) renames for one archive space."""
+    if not space.is_dir():
+        print(f"  (skip) {space} does not exist")
+        return []
+
+    entries = sorted(p.name for p in space.iterdir() if p.is_dir())
+
+    # Names already in the target scheme are taken slots we must not collide with.
+    taken = {n for n in entries if NEW.match(n)}
+
+    legacy = []
+    for name in entries:
+        if NEW.match(name):
+            continue
+        base, key = base_and_sortkey(name)
+        if base is None:
+            print(f"  (warn) unrecognized name, leaving as-is: {space.name}/{name}")
+            continue
+        legacy.append((key, name, base))
+
+    legacy.sort(key=lambda t: (t[0], t[1]))  # chronological, then name
+
+    renames = []
+    for _key, name, base in legacy:
+        src = space / name
+        if name_is_embedded(src, name):
+            print(f"  (warn) name embedded in a file, leaving as-is: {space.name}/{name}")
+            continue
+        idx = 0
+        while True:
+            candidate = f"{base}-{idx:03d}"
+            if candidate not in taken and not (space / candidate).exists():
+                break
+            idx += 1
+        taken.add(candidate)
+        renames.append((name, candidate))
+    return renames
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--apply", action="store_true", help="perform the renames (default: dry-run)")
+    args = parser.parse_args()
+
+    rmrf, bkup = read_paths()
+    total = 0
+    for space in (rmrf, bkup):
+        print(f"=== {space} ===")
+        renames = plan_space(space)
+        for src, dst in renames:
+            print(f"  {src}  ->  {dst}")
+            if args.apply:
+                os.rename(space / src, space / dst)
+        print(f"  {len(renames)} director{'y' if len(renames) == 1 else 'ies'} "
+              f"{'renamed' if args.apply else 'to rename'}")
+        total += len(renames)
+
+    print()
+    if args.apply:
+        print(f"Done: {total} directories renamed.")
+    else:
+        print(f"Dry run: {total} directories would be renamed. Re-run with --apply to execute.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
