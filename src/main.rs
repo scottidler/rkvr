@@ -1,6 +1,6 @@
 // src/main.rs
 use libc::getuid;
-use log::{debug, info, warn};
+use log::{debug, info};
 use std::collections::HashMap;
 use std::env;
 use std::fs::OpenOptions;
@@ -269,21 +269,14 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
         targets
     );
 
-    let metadata_content = match resolve_eza_path() {
-        Ok(eza_tree) => {
-            let output = Command::new(&eza_tree)
-                .args(EZA_ARGS)
-                .args(targets.iter().map(|t| t.to_str().unwrap()))
-                .output()
-                .wrap_err("Failed to execute eza command")?;
-            String::from_utf8_lossy(&output.stdout).into_owned()
-        }
-        // The listing is informational; a missing eza must not block the archive.
-        Err(e) => {
-            warn!("{e}; recording plain target paths in metadata instead");
-            targets.iter().map(|t| format!("{}\n", t.display())).collect()
-        }
-    };
+    let eza_tree = resolve_eza_path()?;
+    let output = Command::new(&eza_tree)
+        .args(EZA_ARGS)
+        .args(targets.iter().map(|t| t.to_str().unwrap()))
+        .output()
+        .wrap_err("Failed to execute eza command")?;
+
+    let metadata_content = String::from_utf8_lossy(&output.stdout);
     debug!("Metadata content: {}", metadata_content);
 
     let target_names: Vec<String> = targets
@@ -297,7 +290,7 @@ fn create_metadata(base: &Path, cwd: &Path, targets: &[PathBuf]) -> Result<()> {
 
     let metadata = Metadata {
         cwd: cwd.to_path_buf(),
-        contents: metadata_content,
+        contents: metadata_content.to_string(),
         targets: target_names,
     };
 
