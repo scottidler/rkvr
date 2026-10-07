@@ -400,3 +400,41 @@ fn test_recovery_functionality() {
         "Archive directory should be removed after recovery"
     );
 }
+
+#[test]
+fn test_rmrf_dangling_symlink() {
+    build_binary();
+
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    let hooks = temp_path.join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let missing = hooks.join("deleted-by-branch.sh");
+    let link = hooks.join("git-no-dash-c.sh");
+    std::os::unix::fs::symlink(&missing, &link).unwrap();
+
+    let rmrf_dir = temp_path.join("rmrf");
+    let bkup_dir = temp_path.join("bkup");
+    fs::create_dir_all(&rmrf_dir).unwrap();
+    fs::create_dir_all(&bkup_dir).unwrap();
+    create_config(temp_path, &rmrf_dir, &bkup_dir);
+
+    let output = run_rkvr_command(&["rmrf", link.to_str().unwrap()], temp_path);
+    assert_success(&output, "rmrf dangling symlink");
+
+    assert!(fs::symlink_metadata(&link).is_err(), "Link should be removed");
+    let archive_dirs = get_archive_dirs(&rmrf_dir);
+    assert_eq!(archive_dirs.len(), 1, "Should have exactly one archive directory");
+    let listing = Command::new("tar")
+        .arg("-tvzf")
+        .arg(archive_dirs[0].join("hooks.tar.gz"))
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(
+        listing.contains(&format!("git-no-dash-c.sh -> {}", missing.display())),
+        "Tarball should hold the link with its original target:\n{listing}"
+    );
+    assert!(read_metadata(&archive_dirs[0]).contains("- git-no-dash-c.sh"));
+}

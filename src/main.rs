@@ -6,7 +6,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::fs::{self, DirEntry, File};
 use std::io::{self, BufWriter, ErrorKind, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::time::SystemTime;
@@ -114,7 +114,24 @@ fn current_uid() -> u32 {
 }
 
 fn file_uid(path: &Path) -> eyre::Result<u32> {
-    Ok(fs::metadata(path)?.uid())
+    Ok(fs::symlink_metadata(path)?.uid())
+}
+
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Canonicalize a symlink's parent and rejoin its file name, so the link
+/// itself is addressed and its target (possibly missing) is never followed.
+fn canonicalize_link(link: &Path) -> io::Result<PathBuf> {
+    let parent = match link.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = link
+        .file_name()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "symlink has no file name"))?;
+    Ok(fs::canonicalize(parent)?.join(name))
 }
 
 fn remove_file_with_sudo(path: &Path, sudo: bool) -> Result<()> {
@@ -373,10 +390,15 @@ fn copy_files(base: &Path, loose: &[PathBuf], sudo: bool) -> Result<()> {
     for src in loose {
         let fname = src.file_name().unwrap();
         let dest = base.join(fname);
-        let owner = fs::metadata(src)?.uid();
+        let meta = fs::symlink_metadata(src)?;
+        let owner = meta.uid();
         if owner == me {
-            fs::copy(src, &dest)?;
-            fs::set_permissions(&dest, fs::metadata(src)?.permissions())?;
+            if meta.file_type().is_symlink() {
+                symlink(fs::read_link(src)?, &dest)?;
+            } else {
+                fs::copy(src, &dest)?;
+                fs::set_permissions(&dest, meta.permissions())?;
+            }
         } else {
             if !sudo {
                 eyre::bail!(
@@ -463,7 +485,13 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
     debug!("Canonicalized cwd: {}", cwd_canonical.display());
 
     for target in targets {
-        let canonical_path = fs::canonicalize(target).map_err(|e| {
+        let target_is_symlink = is_symlink(target);
+        let canonical_path = if target_is_symlink {
+            canonicalize_link(target)
+        } else {
+            fs::canonicalize(target)
+        }
+        .map_err(|e| {
             if e.kind() == ErrorKind::NotFound {
                 eyre!("{}: No such file or directory", target.display())
             } else {
@@ -481,7 +509,7 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
         };
         debug!("Relative path: {}", relative_path.display());
 
-        if canonical_path.is_dir() {
+        if !target_is_symlink && canonical_path.is_dir() {
             directories.push(canonical_path);
         } else {
             let group_key = relative_path
@@ -503,7 +531,7 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
 
 fn remove_targets(targets: &[PathBuf]) -> Result<()> {
     for target in targets {
-        if target.is_dir() {
+        if !is_symlink(target) && target.is_dir() {
             fs::remove_dir_all(target)?;
         } else {
             fs::remove_file(target)?;
@@ -1167,6 +1195,118 @@ mod tests {
 
         let expected_archive = archive_dir.join(format!("{timestamp}-000"));
         assert!(expected_archive.exists(), "Archive directory should be created");
+    }
+
+    /// The `tar -tv` line for `name` in the bundle's `source.tar.gz`, e.g.
+    /// `lrwxrwxrwx user/group 0 date hook.sh -> /path/missing.sh`.
+    fn tarball_entry(archive_dir: &Path, timestamp: &str, name: &str) -> String {
+        let tarball = archive_dir.join(format!("{timestamp}-000")).join("source.tar.gz");
+        let output = Command::new("tar").arg("-tvzf").arg(&tarball).output().unwrap();
+        assert!(output.status.success(), "tar -tvzf {} failed", tarball.display());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .find(|l| l.contains(&format!(" {name} -> ")))
+            .unwrap_or_else(|| panic!("no symlink entry for {name} in {}", tarball.display()))
+            .to_string()
+    }
+
+    #[test]
+    fn test_categorize_paths_dangling_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = fs::canonicalize(temp_dir.path()).unwrap();
+
+        let link = temp_path.join("dangling");
+        symlink(temp_path.join("gone"), &link).unwrap();
+
+        let (directories, groups) = categorize_paths(std::slice::from_ref(&link), &temp_path).unwrap();
+
+        assert!(directories.is_empty());
+        assert_eq!(groups, vec![vec![link]]);
+    }
+
+    #[test]
+    fn test_archive_and_remove_dangling_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        let source_dir = temp_path.join("source");
+        let archive_dir = temp_path.join("archive");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let missing = source_dir.join("missing.sh");
+        let link = source_dir.join("hook.sh");
+        symlink(&missing, &link).unwrap();
+
+        let timestamp = "2026-06-14-153045";
+        archive(&archive_dir, timestamp, std::slice::from_ref(&link), false, true, None).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err(), "Link should be removed");
+        assert!(!missing.exists(), "Missing target should stay missing");
+        let entry = tarball_entry(&archive_dir, timestamp, "hook.sh");
+        assert!(entry.starts_with('l'), "Archive should hold the link itself: {entry}");
+        assert!(entry.ends_with(&format!("-> {}", missing.display())));
+    }
+
+    #[test]
+    fn test_archive_and_remove_symlink_to_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        let source_dir = temp_path.join("source");
+        let archive_dir = temp_path.join("archive");
+        let checkout = temp_path.join("checkout");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(checkout.join("keep.txt"), "keep").unwrap();
+
+        let link = source_dir.join("repo");
+        symlink(&checkout, &link).unwrap();
+
+        let timestamp = "2026-06-14-153045";
+        archive(&archive_dir, timestamp, std::slice::from_ref(&link), false, true, None).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err(), "Link should be removed");
+        assert!(
+            checkout.join("keep.txt").exists(),
+            "Directory behind the link should survive"
+        );
+        let entry = tarball_entry(&archive_dir, timestamp, "repo");
+        assert!(entry.ends_with(&format!("-> {}", checkout.display())));
+        assert!(!archive_dir
+            .join(format!("{timestamp}-000"))
+            .join("repo.tar.gz")
+            .exists());
+    }
+
+    #[test]
+    fn test_archive_and_remove_symlink_to_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        let source_dir = temp_path.join("source");
+        let archive_dir = temp_path.join("archive");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let real = temp_path.join("real.txt");
+        fs::write(&real, "content").unwrap();
+        let link = source_dir.join("alias.txt");
+        symlink(&real, &link).unwrap();
+
+        let timestamp = "2026-06-14-153045";
+        archive(&archive_dir, timestamp, std::slice::from_ref(&link), false, true, None).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err(), "Link should be removed");
+        assert_eq!(
+            fs::read_to_string(&real).unwrap(),
+            "content",
+            "File behind the link should survive"
+        );
+        let entry = tarball_entry(&archive_dir, timestamp, "alias.txt");
+        assert!(entry.ends_with(&format!("-> {}", real.display())));
     }
 
     #[test]
