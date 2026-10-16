@@ -13,4 +13,5 @@ jobs:
   ci:
     uses: tatari-tv/github-actions-public/.github/workflows/rust-ci.yml@v2.1.0
     with:
+      rust-version: "1.99.1"
       eza-version: v0.23.5
