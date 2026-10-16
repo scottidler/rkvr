@@ -11,6 +11,6 @@ permissions:
 
 jobs:
   mutants:
-    uses: tatari-tv/github-actions-public/.github/workflows/mutants.yml@v2.3.0
+    uses: tatari-tv/github-actions-public/.github/workflows/mutants.yml@v2.3.1
     with:
       eza-version: v0.23.5
