@@ -13,7 +13,7 @@ fn get_log_file_path_for_help() -> String {
 #[command(
     name = "rkvr",
     about = "A safe file archival and removal tool",
-    version = env!("GIT_DESCRIBE"),
+    version = env!("BUILD_VERSION"),
     author = "Scott A. Idler <scott.a.idler@gmail.com>",
     arg_required_else_help = true,
     after_help = format!("Logs are written to: {}", get_log_file_path_for_help())
