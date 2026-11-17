@@ -83,3 +83,23 @@ None.
 
 ### Open questions
 None. Deferred audit item: two untouched tests fail under a symlinked `TMPDIR`, already parked in the doc's Non-Goals.
+
+## Release fix: surviving mutants (v0.1.26 CI)
+
+### Design decisions
+- `bump release` CI went red on `mutants / report`: 16 surviving mutants in the new code (run 43992179672). Killed with seams plus tests, no skips:
+  - `initial_passwd_buf_len`, `next_passwd_buf_len` (`src/main.rs`): buffer sizing out of `passwd_home`, boundary tests
+  - `usable_home`: drops the redundant `is_empty() ||` (an empty path is relative), tested on empty, relative, absolute
+  - `classify_removal_error` + `RemovalError`: the unlink-error arms of `remove_path` as a pure function, every kind tested
+  - `cleanup_entry` takes a `&Path`; the `DirEntry` unwrap moved into `cleanup`. Tests: missing path is Ok, threshold is exclusive (exactly at `keep` is kept)
+  - New fs tests: `remove_path_unstatable_is_error` (ENOTDIR), `rmrf_cfg_unsearchable_dir_is_error` (EACCES stat), `cleanup_unsearchable_bin_is_error` (`r--` bin), `parent_display_cases`
+
+### Deviations
+None. Behavior unchanged; the seams are private.
+
+### Tradeoffs
+- Seams + tests vs. `#[mutants::skip]`: skips would hide the race arms (NotFound mid-removal) for good; a pure classifier tests them without a race.
+
+### Open questions
+None.
+- `next_passwd_buf_len` floors the retry size at 1024 (`clamp`): the local run timed out on `initial_passwd_buf_len -> 0`, because `0 * 2` stays 0 and ERANGE looped forever. Test `next_passwd_buf_len(0) == Some(1024)`. Local diff-scoped run after: 60 mutants, 58 caught, 2 unviable, 0 missed, 0 timeouts.

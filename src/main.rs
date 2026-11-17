@@ -125,8 +125,7 @@ fn passwd_home(user: &str) -> Result<Option<PathBuf>> {
     debug!("passwd_home: user={}", user);
     let c_user = CString::new(user).map_err(|_| eyre!("user name {:?} contains a NUL byte", user))?;
 
-    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
-    let mut buf_len = if suggested > 0 { (suggested as usize).min(PASSWD_BUF_MAX) } else { 1024 };
+    let mut buf_len = initial_passwd_buf_len(unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) });
 
     loop {
         let mut buf: Vec<libc::c_char> = vec![0; buf_len];
@@ -136,15 +135,14 @@ fn passwd_home(user: &str) -> Result<Option<PathBuf>> {
         let rc = unsafe { libc::getpwnam_r(c_user.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
 
         if rc == libc::ERANGE {
-            if buf_len >= PASSWD_BUF_MAX {
-                return Err(eyre!(
+            buf_len = next_passwd_buf_len(buf_len).ok_or_else(|| {
+                eyre!(
                     "getpwnam_r({}) failed: {} (buffer cap {} bytes reached)",
                     user,
                     io::Error::from_raw_os_error(rc),
                     PASSWD_BUF_MAX
-                ));
-            }
-            buf_len = (buf_len * 2).min(PASSWD_BUF_MAX);
+                )
+            })?;
             debug!("passwd_home: ERANGE, retrying with {} bytes", buf_len);
             continue;
         }
@@ -171,17 +169,41 @@ fn passwd_home(user: &str) -> Result<Option<PathBuf>> {
 
         // SAFETY: `pw_dir` points into `buf`, which is alive; the bytes are copied out here.
         let bytes = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_bytes();
-        let home = PathBuf::from(OsStr::from_bytes(bytes));
-        if home.as_os_str().is_empty() || home.is_relative() {
-            return Err(eyre!(
-                "passwd entry for {} has an unusable home directory {:?}",
-                user,
-                home
-            ));
-        }
+        let home = usable_home(user, PathBuf::from(OsStr::from_bytes(bytes)))?;
         debug!("passwd_home: {} -> {}", user, home.display());
         return Ok(Some(home));
     }
+}
+
+/// First `getpwnam_r` buffer size: what `sysconf` suggests (capped), or 1024 when it has none.
+fn initial_passwd_buf_len(suggested: libc::c_long) -> usize {
+    if suggested > 0 {
+        (suggested as usize).min(PASSWD_BUF_MAX)
+    } else {
+        1024
+    }
+}
+
+/// Buffer size to retry with after `ERANGE`: doubled up to the cap; `None` once at the cap.
+fn next_passwd_buf_len(current: usize) -> Option<usize> {
+    if current >= PASSWD_BUF_MAX {
+        None
+    } else {
+        // Floor of 1024: a zero-length start must still grow, or ERANGE loops forever.
+        Some((current * 2).clamp(1024, PASSWD_BUF_MAX))
+    }
+}
+
+/// A passwd `pw_dir` is usable only as an absolute path (an empty one is relative too).
+fn usable_home(user: &str, home: PathBuf) -> Result<PathBuf> {
+    if home.is_relative() {
+        return Err(eyre!(
+            "passwd entry for {} has an unusable home directory {:?}",
+            user,
+            home
+        ));
+    }
+    Ok(home)
 }
 
 /// Home directory whose `.config/rmrf/rmrf.cfg` applies: the invoking user's when running
@@ -267,21 +289,41 @@ fn remove_path(path: &Path, sudo: bool) -> Result<()> {
     };
     let is_dir = meta.is_dir();
     let plain = if is_dir { fs::remove_dir_all(path) } else { fs::remove_file(path) };
-    match plain {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => {
+    let Err(e) = plain else { return Ok(()) };
+    match classify_removal_error(e.kind(), escalation_allowed(sudo, current_uid())) {
+        RemovalError::Gone => {
             debug!("remove_path: {} vanished during removal", path.display());
             Ok(())
         }
-        Err(e) if e.kind() == ErrorKind::PermissionDenied && escalation_allowed(sudo, current_uid()) => {
-            sudo_rm(path, is_dir)
-        }
-        Err(e) if e.kind() == ErrorKind::PermissionDenied => Err(eyre!(
+        RemovalError::Escalate => sudo_rm(path, is_dir),
+        RemovalError::Denied => Err(eyre!(
             "permission denied removing {} (parent: {})",
             path.display(),
             parent_display(path)
         )),
-        Err(e) => Err(e).wrap_err_with(|| format!("Failed to remove {}", path.display())),
+        RemovalError::Other => Err(e).wrap_err_with(|| format!("Failed to remove {}", path.display())),
+    }
+}
+
+/// What a failed plain unlink means for `remove_path`.
+#[derive(Debug, PartialEq, Eq)]
+enum RemovalError {
+    /// Already absent: counts as removed.
+    Gone,
+    /// The kernel refused and `sudo rm` may retry it.
+    Escalate,
+    /// The kernel refused and escalation is off (or pointless as root).
+    Denied,
+    /// Any other failure, reported as is.
+    Other,
+}
+
+fn classify_removal_error(kind: ErrorKind, escalate: bool) -> RemovalError {
+    match kind {
+        ErrorKind::NotFound => RemovalError::Gone,
+        ErrorKind::PermissionDenied if escalate => RemovalError::Escalate,
+        ErrorKind::PermissionDenied => RemovalError::Denied,
+        _ => RemovalError::Other,
     }
 }
 
@@ -332,9 +374,11 @@ fn cleanup(dir_path: &std::path::Path, days: usize, sudo: bool) -> Result<()> {
 
     let mut failures: Vec<eyre::Report> = Vec::new();
     for entry in entries {
-        match cleanup_entry(entry, now, delete_threshold, sudo) {
-            Ok(()) => {}
-            Err(e) => failures.push(e),
+        let outcome = entry
+            .wrap_err("Failed to read bin directory entry")
+            .and_then(|entry| cleanup_entry(&entry.path(), now, delete_threshold, sudo));
+        if let Err(e) = outcome {
+            failures.push(e);
         }
     }
 
@@ -354,16 +398,10 @@ fn cleanup(dir_path: &std::path::Path, days: usize, sudo: bool) -> Result<()> {
 }
 
 /// One bin entry of `cleanup`: remove it when its own (`lstat`) mtime is past the threshold.
-fn cleanup_entry(
-    entry: io::Result<DirEntry>,
-    now: SystemTime,
-    delete_threshold: std::time::Duration,
-    sudo: bool,
-) -> Result<()> {
-    let path = entry.wrap_err("Failed to read bin directory entry")?.path();
+fn cleanup_entry(path: &Path, now: SystemTime, delete_threshold: std::time::Duration, sudo: bool) -> Result<()> {
     debug!("Checking path: {}", path.to_string_lossy());
 
-    let metadata = match fs::symlink_metadata(&path) {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e).wrap_err_with(|| format!("Failed to stat {}", path.display())),
@@ -380,7 +418,7 @@ fn cleanup_entry(
         );
         if duration_since_modified > delete_threshold {
             info!("Deleting path: {}", path.to_string_lossy());
-            remove_path(&path, sudo)?;
+            remove_path(path, sudo)?;
         }
     }
     Ok(())
@@ -1849,6 +1887,129 @@ archive_location: "/tmp/integration_test"
         assert!(locked_a.join("file.txt").exists(), "refused bundle content survives");
         assert!(locked_b.join("file.txt").exists(), "refused bundle content survives");
         assert!(!free.exists(), "removable stale bundle is still removed");
+    }
+
+    #[test]
+    fn cleanup_unsearchable_bin_is_error() {
+        assert_not_root();
+        let temp_dir = TempDir::new().unwrap();
+        let bin = temp_dir.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::write(bin.join("2026-01-01-000000-000"), "x").unwrap();
+        // r-- lets read_dir list names, but every lstat under it fails EACCES.
+        set_mode(&bin, 0o444);
+
+        let result = cleanup(&bin, 1, false);
+        set_mode(&bin, 0o755);
+
+        let message = format!("{:#}", result.expect_err("an unstatable bin entry must fail cleanup"));
+        assert!(message.contains("1 stale entries"), "message: {message}");
+    }
+
+    #[test]
+    fn cleanup_entry_missing_path_is_ok() {
+        let temp_dir = TempDir::new().unwrap();
+        let gone = temp_dir.path().join("2026-01-01-000000-000");
+        let day = std::time::Duration::from_secs(86_400);
+        cleanup_entry(&gone, SystemTime::now(), day, false).expect("an entry that vanished counts as cleaned");
+    }
+
+    #[test]
+    fn cleanup_entry_threshold_is_exclusive() {
+        let temp_dir = TempDir::new().unwrap();
+        let entry = temp_dir.path().join("2026-01-01-000000-000");
+        fs::write(&entry, "x").unwrap();
+        let mtime = fs::symlink_metadata(&entry).unwrap().modified().unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+
+        cleanup_entry(&entry, mtime + day, day, false).unwrap();
+        assert!(entry.exists(), "an entry exactly at the threshold is kept");
+
+        cleanup_entry(&entry, mtime + day + std::time::Duration::from_secs(1), day, false).unwrap();
+        assert!(!entry.exists(), "an entry past the threshold is removed");
+    }
+
+    #[test]
+    fn remove_path_unstatable_is_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("file.txt");
+        fs::write(&file, "x").unwrap();
+        // lstat of file.txt/child fails ENOTDIR, which is not "already gone".
+        let err = remove_path(&file.join("child"), false).expect_err("ENOTDIR must not count as removed");
+        assert!(format!("{:#}", err).contains("Failed to stat"), "error: {err:#}");
+    }
+
+    #[test]
+    fn classify_removal_error_cases() {
+        assert_eq!(classify_removal_error(ErrorKind::NotFound, false), RemovalError::Gone);
+        assert_eq!(classify_removal_error(ErrorKind::NotFound, true), RemovalError::Gone);
+        assert_eq!(
+            classify_removal_error(ErrorKind::PermissionDenied, true),
+            RemovalError::Escalate
+        );
+        assert_eq!(
+            classify_removal_error(ErrorKind::PermissionDenied, false),
+            RemovalError::Denied
+        );
+        assert_eq!(classify_removal_error(ErrorKind::Other, true), RemovalError::Other);
+        assert_eq!(classify_removal_error(ErrorKind::Other, false), RemovalError::Other);
+    }
+
+    #[test]
+    fn parent_display_cases() {
+        assert_eq!(parent_display(Path::new("a.txt")), ".");
+        assert_eq!(parent_display(Path::new("src/a.txt")), "src");
+        assert_eq!(parent_display(Path::new("/")), ".");
+    }
+
+    #[test]
+    fn rmrf_cfg_unsearchable_dir_is_error() {
+        assert_not_root();
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().join("rmrf");
+        fs::create_dir(&dir).unwrap();
+        set_mode(&dir, 0o000);
+
+        let result = load_rmrf_cfg(&dir.join("rmrf.cfg"));
+        set_mode(&dir, 0o755);
+
+        let err = result.expect_err("an EACCES stat must not fall back to defaults");
+        assert!(
+            format!("{:#}", err).contains("Failed to stat rmrf config"),
+            "error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn rmrf_cfg_initial_passwd_buf_len_cases() {
+        assert_eq!(initial_passwd_buf_len(-1), 1024);
+        assert_eq!(initial_passwd_buf_len(0), 1024);
+        assert_eq!(initial_passwd_buf_len(4096), 4096);
+        assert_eq!(
+            initial_passwd_buf_len((PASSWD_BUF_MAX * 4) as libc::c_long),
+            PASSWD_BUF_MAX
+        );
+    }
+
+    #[test]
+    fn rmrf_cfg_next_passwd_buf_len_cases() {
+        assert_eq!(next_passwd_buf_len(0), Some(1024));
+        assert_eq!(next_passwd_buf_len(1024), Some(2048));
+        assert_eq!(next_passwd_buf_len(PASSWD_BUF_MAX - 1), Some(PASSWD_BUF_MAX));
+        assert_eq!(next_passwd_buf_len(PASSWD_BUF_MAX), None);
+    }
+
+    #[test]
+    fn rmrf_cfg_usable_home_cases() {
+        assert_eq!(
+            usable_home("u", PathBuf::from("/root")).unwrap(),
+            PathBuf::from("/root")
+        );
+        assert!(usable_home("u", PathBuf::new()).is_err(), "empty pw_dir is unusable");
+        assert!(
+            usable_home("u", PathBuf::from("home/u")).is_err(),
+            "relative pw_dir is unusable"
+        );
     }
 
     #[test]
