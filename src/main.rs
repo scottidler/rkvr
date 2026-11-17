@@ -246,56 +246,73 @@ fn canonicalize_link(link: &Path) -> io::Result<PathBuf> {
     Ok(fs::canonicalize(parent)?.join(name))
 }
 
-fn remove_file_with_sudo(path: &Path, sudo: bool) -> Result<()> {
-    if sudo {
-        let owner = fs::metadata(path)?.uid();
-        let need_sudo = owner != current_uid();
+/// Whether a removal the kernel refused may be retried through `sudo rm`.
+/// Never as root: `sudo` adds nothing there, and an EPERM as root is reported, not retried.
+fn escalation_allowed(sudo: bool, uid: u32) -> bool {
+    sudo && uid != 0
+}
 
-        if need_sudo {
-            debug!("Using sudo to remove file: {}", path.to_string_lossy());
-            let status = Command::new("sudo")
-                .args(["rm", "-f", &path.to_string_lossy()])
-                .status()?;
-
-            if !status.success() {
-                eyre::bail!("Failed to remove file {} with sudo (status {})", path.display(), status);
-            }
+/// Remove `path` without following it: a symlink is unlinked, a real directory is removed
+/// recursively. A path already gone counts as removed. When the kernel refuses with
+/// `PermissionDenied` and escalation is allowed, retry as `sudo rm -f|-rf -- <path>`.
+fn remove_path(path: &Path, sudo: bool) -> Result<()> {
+    debug!("remove_path: path={} sudo={}", path.display(), sudo);
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            debug!("remove_path: {} already gone", path.display());
             return Ok(());
         }
+        Err(e) => return Err(e).wrap_err_with(|| format!("Failed to stat {}", path.display())),
+    };
+    let is_dir = meta.is_dir();
+    let plain = if is_dir { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+    match plain {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            debug!("remove_path: {} vanished during removal", path.display());
+            Ok(())
+        }
+        Err(e) if e.kind() == ErrorKind::PermissionDenied && escalation_allowed(sudo, current_uid()) => {
+            sudo_rm(path, is_dir)
+        }
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => Err(eyre!(
+            "permission denied removing {} (parent: {})",
+            path.display(),
+            parent_display(path)
+        )),
+        Err(e) => Err(e).wrap_err_with(|| format!("Failed to remove {}", path.display())),
     }
+}
 
-    // Use regular removal if sudo is not enabled or not needed
-    fs::remove_file(path)?;
+/// The directory whose permissions govern unlinking `path`, for error messages.
+fn parent_display(path: &Path) -> String {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.display().to_string(),
+        _ => ".".to_string(),
+    }
+}
+
+/// `sudo rm -f -- <path>` (`-rf` only for a real directory). `rm` never follows a symlink
+/// operand, and `--` keeps a leading-dash path from being read as an option.
+fn sudo_rm(path: &Path, is_dir: bool) -> Result<()> {
+    let flags = if is_dir { "-rf" } else { "-f" };
+    info!("Escalating: sudo rm {} -- {}", flags, path.display());
+    let status = Command::new("sudo")
+        .arg("rm")
+        .arg(flags)
+        .arg("--")
+        .arg(path)
+        .status()
+        .wrap_err_with(|| format!("Failed to run sudo rm for {}", path.display()))?;
+    if !status.success() {
+        return Err(eyre!("sudo rm {} -- {} failed ({})", flags, path.display(), status));
+    }
     Ok(())
 }
 
-fn remove_directory_with_sudo(path: &Path, sudo: bool) -> Result<()> {
-    if sudo {
-        let owner = fs::metadata(path)?.uid();
-        let need_sudo = owner != current_uid();
-
-        if need_sudo {
-            debug!("Using sudo to remove directory: {}", path.to_string_lossy());
-            let status = Command::new("sudo")
-                .args(["rm", "-rf", &path.to_string_lossy()])
-                .status()?;
-
-            if !status.success() {
-                eyre::bail!(
-                    "Failed to remove directory {} with sudo (status {})",
-                    path.display(),
-                    status
-                );
-            }
-            return Ok(());
-        }
-    }
-
-    // Use regular removal if sudo is not enabled or not needed
-    fs::remove_dir_all(path)?;
-    Ok(())
-}
-
+/// Remove every bin entry older than `days`, judged by the entry itself (never a symlink's
+/// target). Attempts every entry; any failures are printed and returned as one error.
 fn cleanup(dir_path: &std::path::Path, days: usize, sudo: bool) -> Result<()> {
     info!(
         "fn cleanup: dir_path={} days={} sudo={}",
@@ -310,40 +327,62 @@ fn cleanup(dir_path: &std::path::Path, days: usize, sudo: bool) -> Result<()> {
     let delete_threshold = std::time::Duration::from_secs(60 * 60 * 24 * days as u64);
     debug!("Delete threshold duration: {:?} ({} days)", delete_threshold, days);
 
-    let entries = fs::read_dir(dir_path)?;
-    debug!("Directory entries read: entries={:?}", entries);
+    let entries =
+        fs::read_dir(dir_path).wrap_err_with(|| format!("Failed to read bin directory {}", dir_path.display()))?;
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        debug!("Checking path: {}", path.to_string_lossy());
-
-        let metadata = fs::metadata(&path)?;
-        debug!("Metadata retrieved");
-
-        let modified_time = metadata.modified()?;
-        debug!("Modified time: {:?}", modified_time);
-
-        if let Ok(duration_since_modified) = now.duration_since(modified_time) {
-            debug!(
-                "Duration since modified: {:?}, Delete threshold: {:?}",
-                duration_since_modified, delete_threshold
-            );
-
-            if duration_since_modified > delete_threshold {
-                info!("Deleting path: {}", path.to_string_lossy());
-
-                if metadata.is_dir() {
-                    debug!("Removing directory: {}", path.to_string_lossy());
-                    remove_directory_with_sudo(&path, sudo)?;
-                } else {
-                    debug!("Removing file: {}", path.to_string_lossy());
-                    remove_file_with_sudo(&path, sudo)?;
-                }
-            }
+    let mut failures: Vec<eyre::Report> = Vec::new();
+    for entry in entries {
+        match cleanup_entry(entry, now, delete_threshold, sudo) {
+            Ok(()) => {}
+            Err(e) => failures.push(e),
         }
     }
 
+    if !failures.is_empty() {
+        for failure in &failures {
+            eprintln!("{:#}", failure);
+        }
+        return Err(eyre!(
+            "{} stale entries in {} were not fully removed",
+            failures.len(),
+            dir_path.display()
+        ));
+    }
+
     info!("Cleanup completed");
+    Ok(())
+}
+
+/// One bin entry of `cleanup`: remove it when its own (`lstat`) mtime is past the threshold.
+fn cleanup_entry(
+    entry: io::Result<DirEntry>,
+    now: SystemTime,
+    delete_threshold: std::time::Duration,
+    sudo: bool,
+) -> Result<()> {
+    let path = entry.wrap_err("Failed to read bin directory entry")?.path();
+    debug!("Checking path: {}", path.to_string_lossy());
+
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).wrap_err_with(|| format!("Failed to stat {}", path.display())),
+    };
+    let modified_time = metadata
+        .modified()
+        .wrap_err_with(|| format!("Failed to read mtime of {}", path.display()))?;
+    debug!("Modified time: {:?}", modified_time);
+
+    if let Ok(duration_since_modified) = now.duration_since(modified_time) {
+        debug!(
+            "Duration since modified: {:?}, Delete threshold: {:?}",
+            duration_since_modified, delete_threshold
+        );
+        if duration_since_modified > delete_threshold {
+            info!("Deleting path: {}", path.to_string_lossy());
+            remove_path(&path, sudo)?;
+        }
+    }
     Ok(())
 }
 
@@ -641,15 +680,25 @@ fn categorize_paths(targets: &[PathBuf], cwd: &Path) -> Result<(Vec<PathBuf>, Ve
     Ok((directories, groups))
 }
 
-fn remove_targets(targets: &[PathBuf]) -> Result<()> {
-    for target in targets {
-        if !is_symlink(target) && target.is_dir() {
-            fs::remove_dir_all(target)?;
-        } else {
-            fs::remove_file(target)?;
-        }
+/// Remove every target, continuing past failures. Every target is already archived, so a
+/// survivor is printed to stderr and counted in the returned error rather than abandoning the rest.
+fn remove_targets(targets: &[PathBuf], sudo: bool) -> Result<()> {
+    debug!("remove_targets: targets={:?} sudo={}", targets, sudo);
+    let failures: Vec<eyre::Report> = targets
+        .iter()
+        .filter_map(|target| remove_path(target, sudo).err())
+        .collect();
+    if failures.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    for failure in &failures {
+        eprintln!("{:#}", failure);
+    }
+    Err(eyre!(
+        "{} of {} targets were archived but not fully removed",
+        failures.len(),
+        targets.len()
+    ))
 }
 
 /// Return the next free `<timestamp>-<NNN>` bundle directory under `path`,
@@ -724,7 +773,7 @@ fn archive(
     }
 
     if remove {
-        remove_targets(targets)?;
+        remove_targets(targets, sudo)?;
     }
 
     if let Some(days) = keep {
@@ -1223,7 +1272,7 @@ mod tests {
 
         let targets = vec![test_file.clone(), test_dir.clone()];
 
-        remove_targets(&targets).unwrap();
+        remove_targets(&targets, false).unwrap();
 
         assert!(!test_file.exists(), "File should be removed");
         assert!(!test_dir.exists(), "Directory should be removed");
@@ -1562,46 +1611,6 @@ archive_location: "/tmp/integration_test"
     }
 
     #[test]
-    fn test_remove_file_with_sudo_user_owned() {
-        let temp_dir = TempDir::new().unwrap();
-        let temp_path = temp_dir.path();
-
-        let test_file = temp_path.join("test_file.txt");
-        fs::write(&test_file, "test content").unwrap();
-
-        // Test removing user-owned file with sudo=false
-        remove_file_with_sudo(&test_file, false).unwrap();
-        assert!(!test_file.exists(), "File should be removed");
-
-        // Test removing user-owned file with sudo=true
-        let test_file2 = temp_path.join("test_file2.txt");
-        fs::write(&test_file2, "test content").unwrap();
-        remove_file_with_sudo(&test_file2, true).unwrap();
-        assert!(!test_file2.exists(), "File should be removed");
-    }
-
-    #[test]
-    fn test_remove_directory_with_sudo_user_owned() {
-        let temp_dir = TempDir::new().unwrap();
-        let temp_path = temp_dir.path();
-
-        let test_dir = temp_path.join("test_dir");
-        fs::create_dir_all(&test_dir).unwrap();
-        fs::write(test_dir.join("file.txt"), "content").unwrap();
-
-        // Test removing user-owned directory with sudo=false
-        remove_directory_with_sudo(&test_dir, false).unwrap();
-        assert!(!test_dir.exists(), "Directory should be removed");
-
-        // Test removing user-owned directory with sudo=true
-        let test_dir2 = temp_path.join("test_dir2");
-        fs::create_dir_all(&test_dir2).unwrap();
-        fs::write(test_dir2.join("file.txt"), "content").unwrap();
-        remove_directory_with_sudo(&test_dir2, true).unwrap();
-        assert!(!test_dir2.exists(), "Directory should be removed");
-    }
-
-    #[test]
     fn test_cleanup_old_directories() {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path();
@@ -1624,6 +1633,222 @@ archive_location: "/tmp/integration_test"
         // Both directories should be deleted with 0 day threshold
         assert!(!old_dir.exists(), "Old directory should be removed");
         assert!(!recent_dir.exists(), "Directory should be removed with 0 day threshold");
+    }
+
+    fn assert_not_root() {
+        assert_ne!(
+            current_uid(),
+            0,
+            "running as root: root bypasses directory permissions, so this EACCES test would pass vacuously"
+        );
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Back-date `path`'s own mtime (`lstat`, never a symlink's target) by `days`.
+    fn set_lstat_mtime_days_ago(path: &Path, days: u64) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        ts.tv_sec = (now - days * 24 * 60 * 60) as libc::time_t;
+        let times = [ts, ts];
+        // SAFETY: `c_path` and `times` are live locals for the duration of the call.
+        let rc = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(rc, 0, "utimensat({}): {}", path.display(), io::Error::last_os_error());
+    }
+
+    #[test]
+    fn escalation_allowed_sudo_non_root() {
+        assert!(escalation_allowed(true, 1000));
+    }
+
+    #[test]
+    fn escalation_allowed_sudo_root() {
+        assert!(!escalation_allowed(true, 0));
+    }
+
+    #[test]
+    fn escalation_allowed_no_sudo_non_root() {
+        assert!(!escalation_allowed(false, 1000));
+    }
+
+    #[test]
+    fn escalation_allowed_no_sudo_root() {
+        assert!(!escalation_allowed(false, 0));
+    }
+
+    #[test]
+    fn remove_path_unwritable_parent_without_sudo_errors() {
+        assert_not_root();
+        let temp_dir = TempDir::new().unwrap();
+        let locked = temp_dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let target = locked.join("a.txt");
+        fs::write(&target, "a").unwrap();
+        set_mode(&locked, 0o555);
+
+        let result = remove_path(&target, false);
+        set_mode(&locked, 0o755);
+
+        let message = format!("{:#}", result.expect_err("unlink in a 0555 dir must fail without sudo"));
+        assert!(message.contains("permission denied"), "message: {message}");
+        assert!(message.contains(&target.display().to_string()), "message: {message}");
+        assert!(
+            message.contains(&format!("(parent: {})", locked.display())),
+            "message: {message}"
+        );
+        assert!(target.exists(), "target must survive a refused removal");
+    }
+
+    #[test]
+    fn remove_path_removes_dangling_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let link = temp_dir.path().join("dangling");
+        symlink(temp_dir.path().join("missing"), &link).unwrap();
+
+        remove_path(&link, false).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err(), "dangling link should be gone");
+    }
+
+    #[test]
+    fn remove_path_missing_target_is_ok() {
+        let temp_dir = TempDir::new().unwrap();
+        remove_path(&temp_dir.path().join("never-existed"), false).unwrap();
+    }
+
+    #[test]
+    fn remove_path_removes_symlink_not_its_target_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let real = temp_dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("keep.txt"), "keep").unwrap();
+        let link = temp_dir.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        remove_path(&link, false).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err(), "link should be gone");
+        assert!(real.join("keep.txt").exists(), "link target must not be touched");
+    }
+
+    #[test]
+    fn remove_path_removes_directory_tree() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().join("tree");
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        fs::write(dir.join("nested/file.txt"), "x").unwrap();
+
+        remove_path(&dir, false).unwrap();
+
+        assert!(!dir.exists(), "directory tree should be gone");
+    }
+
+    #[test]
+    fn remove_targets_continues_past_failure() {
+        assert_not_root();
+        let temp_dir = TempDir::new().unwrap();
+        let locked = temp_dir.path().join("src");
+        let open = temp_dir.path().join("src2");
+        fs::create_dir(&locked).unwrap();
+        fs::create_dir(&open).unwrap();
+        let stuck = locked.join("a.txt");
+        let free = open.join("c.txt");
+        fs::write(&stuck, "a").unwrap();
+        fs::write(&free, "c").unwrap();
+        set_mode(&locked, 0o555);
+
+        // The failing target is first, so removing `free` proves continuation.
+        let result = remove_targets(&[stuck.clone(), free.clone()], false);
+        set_mode(&locked, 0o755);
+
+        let message = format!("{:#}", result.expect_err("a refused target must fail the call"));
+        assert!(message.contains("1 of 2 targets"), "message: {message}");
+        assert!(stuck.exists(), "refused target survives");
+        assert!(!free.exists(), "later target is still removed");
+    }
+
+    #[test]
+    fn remove_targets_dir_and_its_child_is_ok() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().join("dir");
+        let child = dir.join("child.txt");
+        fs::create_dir(&dir).unwrap();
+        fs::write(&child, "c").unwrap();
+
+        remove_targets(&[dir.clone(), child], false).unwrap();
+
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn cleanup_removes_stale_dangling_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let bin = temp_dir.path();
+        let link = bin.join("2026-01-01-000000-000");
+        symlink(bin.join("missing-target"), &link).unwrap();
+        set_lstat_mtime_days_ago(&link, 10);
+        let fresh = bin.join("2026-11-16-000000-000");
+        fs::create_dir(&fresh).unwrap();
+
+        cleanup(bin, 1, false).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link).is_err(),
+            "stale dangling link should be removed"
+        );
+        assert!(fresh.exists(), "fresh bundle should be kept");
+    }
+
+    #[test]
+    fn cleanup_continues_past_failure() {
+        assert_not_root();
+        let temp_dir = TempDir::new().unwrap();
+        let bin = temp_dir.path();
+
+        // Two refused bundles around one removable one: whatever order read_dir yields,
+        // stopping after the first failure either skips `free` or undercounts to 1.
+        let make_stuck = |name: &str| {
+            let stuck = bin.join(name);
+            let locked = stuck.join("locked");
+            fs::create_dir_all(&locked).unwrap();
+            fs::write(locked.join("file.txt"), "x").unwrap();
+            set_mode(&locked, 0o555);
+            set_lstat_mtime_days_ago(&stuck, 10);
+            locked
+        };
+        let locked_a = make_stuck("2026-01-01-000000-000");
+        let locked_b = make_stuck("2026-01-03-000000-000");
+
+        let free = bin.join("2026-01-02-000000-000");
+        fs::create_dir(&free).unwrap();
+        fs::write(free.join("metadata.yml"), "cwd: /tmp").unwrap();
+        set_lstat_mtime_days_ago(&free, 10);
+
+        let result = cleanup(bin, 1, false);
+        set_mode(&locked_a, 0o755);
+        set_mode(&locked_b, 0o755);
+
+        let message = format!("{:#}", result.expect_err("a refused stale entry must fail cleanup"));
+        assert!(message.contains("2 stale entries"), "message: {message}");
+        assert!(locked_a.join("file.txt").exists(), "refused bundle content survives");
+        assert!(locked_b.join("file.txt").exists(), "refused bundle content survives");
+        assert!(!free.exists(), "removable stale bundle is still removed");
     }
 
     #[test]
