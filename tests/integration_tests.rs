@@ -21,16 +21,17 @@ fn get_binary_path() -> std::path::PathBuf {
     std::env::current_dir().unwrap().join("target/debug/rkvr")
 }
 
-fn create_config(temp_path: &Path, rmrf_dir: &Path, bkup_dir: &Path) -> std::path::PathBuf {
+fn create_config(temp_path: &Path, rmrf_dir: &Path, bkup_dir: &Path, sudo: bool) -> std::path::PathBuf {
     let config_dir = temp_path.join(".config").join("rmrf");
     fs::create_dir_all(&config_dir).unwrap();
     let config_file = config_dir.join("rmrf.cfg");
     fs::write(
         &config_file,
         format!(
-            "[DEFAULT]\nrmrf_path = {}\nbkup_path = {}\nsudo = no\nkeep = 21\nthreshold = 70\n",
+            "[DEFAULT]\nrmrf_path = {}\nbkup_path = {}\nsudo = {}\nkeep = 21\nthreshold = 70\n",
             rmrf_dir.display(),
-            bkup_dir.display()
+            bkup_dir.display(),
+            if sudo { "yes" } else { "no" }
         ),
     )
     .unwrap();
@@ -105,7 +106,7 @@ fn test_rmrf_correct_cwd_for_files_outside_current_dir() {
     fs::create_dir_all(&rmrf_dir).unwrap();
     fs::create_dir_all(&bkup_dir).unwrap();
 
-    create_config(temp_path, &rmrf_dir, &bkup_dir);
+    create_config(temp_path, &rmrf_dir, &bkup_dir, false);
 
     // Run rmrf on files in different directories
     let output = run_rkvr_command(&["rmrf", test_file1.to_str().unwrap()], temp_path);
@@ -171,7 +172,7 @@ fn test_rmrf_no_tar_warnings_for_absolute_paths() {
     fs::create_dir_all(&rmrf_dir).unwrap();
     fs::create_dir_all(&bkup_dir).unwrap();
 
-    create_config(temp_path, &rmrf_dir, &bkup_dir);
+    create_config(temp_path, &rmrf_dir, &bkup_dir, false);
 
     let output = run_rkvr_command(&["rmrf", test_file.to_str().unwrap()], temp_path);
 
@@ -218,7 +219,7 @@ fn test_multiple_files_different_directories() {
     fs::create_dir_all(&rmrf_dir).unwrap();
     fs::create_dir_all(&bkup_dir).unwrap();
 
-    create_config(temp_path, &rmrf_dir, &bkup_dir);
+    create_config(temp_path, &rmrf_dir, &bkup_dir, false);
 
     // Run rmrf on files from different directories
     let output = run_rkvr_command(
@@ -284,7 +285,7 @@ fn test_directory_archiving() {
     fs::create_dir_all(&rmrf_dir).unwrap();
     fs::create_dir_all(&bkup_dir).unwrap();
 
-    create_config(temp_path, &rmrf_dir, &bkup_dir);
+    create_config(temp_path, &rmrf_dir, &bkup_dir, false);
 
     // Run rmrf on directory
     let output = run_rkvr_command(&["rmrf", test_dir.to_str().unwrap()], temp_path);
@@ -328,7 +329,7 @@ fn test_bkup_command() {
     fs::create_dir_all(&rmrf_dir).unwrap();
     fs::create_dir_all(&bkup_dir).unwrap();
 
-    create_config(temp_path, &rmrf_dir, &bkup_dir);
+    create_config(temp_path, &rmrf_dir, &bkup_dir, false);
 
     // Run bkup (should not remove original)
     let output = run_rkvr_command(&["bkup", test_file.to_str().unwrap()], temp_path);
@@ -368,7 +369,7 @@ fn test_recovery_functionality() {
     fs::create_dir_all(&rmrf_dir).unwrap();
     fs::create_dir_all(&bkup_dir).unwrap();
 
-    create_config(temp_path, &rmrf_dir, &bkup_dir);
+    create_config(temp_path, &rmrf_dir, &bkup_dir, false);
 
     // Archive the file
     let rmrf_output = run_rkvr_command(&["rmrf", test_file.to_str().unwrap()], temp_path);
@@ -418,7 +419,7 @@ fn test_rmrf_dangling_symlink() {
     let bkup_dir = temp_path.join("bkup");
     fs::create_dir_all(&rmrf_dir).unwrap();
     fs::create_dir_all(&bkup_dir).unwrap();
-    create_config(temp_path, &rmrf_dir, &bkup_dir);
+    create_config(temp_path, &rmrf_dir, &bkup_dir, false);
 
     let output = run_rkvr_command(&["rmrf", link.to_str().unwrap()], temp_path);
     assert_success(&output, "rmrf dangling symlink");
@@ -437,4 +438,200 @@ fn test_rmrf_dangling_symlink() {
         "Tarball should hold the link with its original target:\n{listing}"
     );
     assert!(read_metadata(&archive_dirs[0]).contains("- git-no-dash-c.sh"));
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn assert_not_root(test: &str) {
+    assert_ne!(
+        unsafe { libc::getuid() },
+        0,
+        "{test} depends on EACCES; root bypasses directory permissions, so it would pass vacuously"
+    );
+}
+
+struct FakeSudo {
+    bin_dir: std::path::PathBuf,
+    log: std::path::PathBuf,
+}
+
+impl FakeSudo {
+    fn new(root: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let bin_dir = root.join("fakebin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let script = bin_dir.join("sudo");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$SUDO_LOG\"\nexit \"$SUDO_RC\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        FakeSudo {
+            bin_dir,
+            log: root.join("sudo.log"),
+        }
+    }
+
+    fn run(&self, args: &[&str], home_dir: &Path, rc: i32) -> std::process::Output {
+        let path = format!(
+            "{}:{}",
+            self.bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Command::new(get_binary_path())
+            .args(args)
+            .env("HOME", home_dir)
+            .env("PATH", path)
+            .env("SUDO_LOG", &self.log)
+            .env("SUDO_RC", rc.to_string())
+            .env_remove("SUDO_USER")
+            .output()
+            .expect("Failed to execute rkvr command")
+    }
+
+    fn lines(&self) -> Vec<String> {
+        fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+}
+
+fn rmrf_sandbox(temp_path: &Path, sudo: bool) -> std::path::PathBuf {
+    let rmrf_dir = temp_path.join("rmrf");
+    let bkup_dir = temp_path.join("bkup");
+    fs::create_dir_all(&rmrf_dir).unwrap();
+    fs::create_dir_all(&bkup_dir).unwrap();
+    create_config(temp_path, &rmrf_dir, &bkup_dir, sudo);
+    rmrf_dir
+}
+
+#[test]
+fn rmrf_escalates_with_sudo_on_eacces() {
+    assert_not_root("rmrf_escalates_with_sudo_on_eacces");
+    build_binary();
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+    rmrf_sandbox(temp_path, true);
+    let fake = FakeSudo::new(temp_path);
+
+    let locked = temp_path.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    let target = locked.join("a b.txt");
+    fs::write(&target, "x").unwrap();
+    set_mode(&locked, 0o555);
+
+    let output = fake.run(&["rmrf", target.to_str().unwrap()], temp_path, 0);
+    set_mode(&locked, 0o755);
+
+    assert_success(&output, "rmrf escalation");
+    assert_eq!(
+        fake.lines(),
+        vec!["rm", "-f", "--", target.to_str().unwrap()],
+        "sudo argv must be exactly rm -f -- <target>"
+    );
+}
+
+#[test]
+fn rmrf_escalates_directory_with_rm_rf() {
+    assert_not_root("rmrf_escalates_directory_with_rm_rf");
+    build_binary();
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+    rmrf_sandbox(temp_path, true);
+    let fake = FakeSudo::new(temp_path);
+
+    let locked = temp_path.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    let target = locked.join("a dir");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("f.txt"), "x").unwrap();
+    set_mode(&locked, 0o555);
+
+    let output = fake.run(&["rmrf", target.to_str().unwrap()], temp_path, 0);
+    set_mode(&locked, 0o755);
+
+    assert_success(&output, "rmrf directory escalation");
+    assert_eq!(
+        fake.lines(),
+        vec!["rm", "-rf", "--", target.to_str().unwrap()],
+        "sudo argv must be exactly rm -rf -- <target>"
+    );
+}
+
+#[test]
+fn rmrf_sudo_failure_reports_survivor() {
+    assert_not_root("rmrf_sudo_failure_reports_survivor");
+    build_binary();
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+    let rmrf_dir = rmrf_sandbox(temp_path, true);
+    let fake = FakeSudo::new(temp_path);
+
+    let locked = temp_path.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    let first = locked.join("a.txt");
+    fs::write(&first, "x").unwrap();
+    let open = temp_path.join("open");
+    fs::create_dir_all(&open).unwrap();
+    let second = open.join("c.txt");
+    fs::write(&second, "y").unwrap();
+    set_mode(&locked, 0o555);
+
+    let output = fake.run(
+        &["rmrf", first.to_str().unwrap(), second.to_str().unwrap()],
+        temp_path,
+        1,
+    );
+    set_mode(&locked, 0o755);
+
+    assert_eq!(output.status.code(), Some(1), "failing sudo must exit 1");
+    assert!(first.exists(), "first target must survive a failing sudo");
+    assert!(!second.exists(), "second target must still be removed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(first.to_str().unwrap()),
+        "stderr must name the survivor:\n{stderr}"
+    );
+    let bundles = get_archive_dirs(&rmrf_dir);
+    assert!(
+        bundles.iter().any(|b| read_metadata(b).contains("a.txt")),
+        "the survivor's bundle must remain in the bin"
+    );
+}
+
+#[test]
+fn rmrf_continues_past_failure() {
+    assert_not_root("rmrf_continues_past_failure");
+    build_binary();
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+    rmrf_sandbox(temp_path, false);
+
+    let src = temp_path.join("src");
+    let src2 = temp_path.join("src2");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&src2).unwrap();
+    let a = src.join("a.txt");
+    let c = src2.join("c.txt");
+    fs::write(&a, "a").unwrap();
+    fs::write(&c, "c").unwrap();
+    set_mode(&src, 0o555);
+
+    let output = run_rkvr_command(&["rmrf", a.to_str().unwrap(), c.to_str().unwrap()], temp_path);
+    set_mode(&src, 0o755);
+
+    assert_eq!(output.status.code(), Some(1), "a failed removal must exit 1");
+    assert!(!c.exists(), "src2/c.txt must be removed despite the earlier failure");
+    assert!(a.exists(), "src/a.txt must survive");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(a.to_str().unwrap()),
+        "stderr must name src/a.txt:\n{stderr}"
+    );
 }
