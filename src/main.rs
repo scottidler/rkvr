@@ -113,6 +113,118 @@ fn current_uid() -> u32 {
     unsafe { getuid() as u32 }
 }
 
+/// Upper bound for the `getpwnam_r` scratch buffer; an entry that needs more is an error.
+const PASSWD_BUF_MAX: usize = 1 << 20;
+
+/// Home directory of `user` from the passwd database.
+/// `Ok(None)` = no such user; `Err` = lookup failure or an unusable `pw_dir`.
+fn passwd_home(user: &str) -> Result<Option<PathBuf>> {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    debug!("passwd_home: user={}", user);
+    let c_user = CString::new(user).map_err(|_| eyre!("user name {:?} contains a NUL byte", user))?;
+
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut buf_len = if suggested > 0 { (suggested as usize).min(PASSWD_BUF_MAX) } else { 1024 };
+
+    loop {
+        let mut buf: Vec<libc::c_char> = vec![0; buf_len];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer refers to a live local; `buf.len()` is the real buffer size.
+        let rc = unsafe { libc::getpwnam_r(c_user.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+
+        if rc == libc::ERANGE {
+            if buf_len >= PASSWD_BUF_MAX {
+                return Err(eyre!(
+                    "getpwnam_r({}) failed: {} (buffer cap {} bytes reached)",
+                    user,
+                    io::Error::from_raw_os_error(rc),
+                    PASSWD_BUF_MAX
+                ));
+            }
+            buf_len = (buf_len * 2).min(PASSWD_BUF_MAX);
+            debug!("passwd_home: ERANGE, retrying with {} bytes", buf_len);
+            continue;
+        }
+        // getpwnam_r(3) ERRORS: "0 or ENOENT or ESRCH or EBADF or EPERM ... The given name
+        // or uid was not found." glibc passes through the last NSS module's errno, e.g.
+        // ENOENT from `sss` when sssd's socket is absent.
+        if result.is_null() && matches!(rc, 0 | libc::ENOENT | libc::ESRCH | libc::EBADF | libc::EPERM) {
+            debug!("passwd_home: no passwd entry for {} (rc={})", user, rc);
+            return Ok(None);
+        }
+        if rc != 0 {
+            return Err(eyre!(
+                "getpwnam_r({}) failed: {}",
+                user,
+                io::Error::from_raw_os_error(rc)
+            ));
+        }
+        if result.is_null() {
+            return Err(eyre!("getpwnam_r({}) returned success without an entry", user));
+        }
+        if pwd.pw_dir.is_null() {
+            return Err(eyre!("passwd entry for {} has no home directory", user));
+        }
+
+        // SAFETY: `pw_dir` points into `buf`, which is alive; the bytes are copied out here.
+        let bytes = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_bytes();
+        let home = PathBuf::from(OsStr::from_bytes(bytes));
+        if home.as_os_str().is_empty() || home.is_relative() {
+            return Err(eyre!(
+                "passwd entry for {} has an unusable home directory {:?}",
+                user,
+                home
+            ));
+        }
+        debug!("passwd_home: {} -> {}", user, home.display());
+        return Ok(Some(home));
+    }
+}
+
+/// Home directory whose `.config/rmrf/rmrf.cfg` applies: the invoking user's when running
+/// as root under `sudo` (`SUDO_USER` set and not `root`), otherwise `fallback`.
+fn rmrf_cfg_home(
+    uid: u32,
+    sudo_user: Option<&str>,
+    lookup: impl Fn(&str) -> Result<Option<PathBuf>>,
+    fallback: Option<PathBuf>,
+) -> Result<PathBuf> {
+    debug!("rmrf_cfg_home: uid={} sudo_user={:?}", uid, sudo_user);
+    match sudo_user {
+        Some(user) if uid == 0 && user != "root" => {
+            lookup(user)?.ok_or_else(|| eyre!("SUDO_USER={} has no passwd entry", user))
+        }
+        _ => fallback.ok_or(eyre!("home dir not found!")),
+    }
+}
+
+/// Read `rmrf.cfg`. Nothing at `path` = an empty `Ini` (every key has a default);
+/// anything there that cannot be read, a dangling symlink included, is an error.
+fn load_rmrf_cfg(path: &Path) -> Result<Ini> {
+    debug!("load_rmrf_cfg: path={}", path.display());
+    let mut ini = Ini::new();
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            info!("No rmrf config at {}, using defaults", path.display());
+            return Ok(ini);
+        }
+        Err(e) => {
+            return Err(e).wrap_err_with(|| format!("Failed to stat rmrf config {}", path.display()));
+        }
+        Ok(_) => {}
+    }
+    let contents =
+        fs::read_to_string(path).wrap_err_with(|| format!("Failed to read rmrf config {}", path.display()))?;
+    ini.read(contents)
+        .map_err(|e| eyre!(e))
+        .wrap_err_with(|| format!("Failed to parse rmrf config {}", path.display()))?;
+    debug!("load_rmrf_cfg: loaded {}", path.display());
+    Ok(ini)
+}
+
 fn file_uid(path: &Path) -> eyre::Result<u32> {
     Ok(fs::symlink_metadata(path)?.uid())
 }
@@ -859,16 +971,16 @@ fn main() -> Result<()> {
     let action: Action = matches.action.clone().unwrap_or_default();
     info!("Action: {:?}", action);
 
-    let rmrf_cfg_path = dirs::home_dir()
-        .ok_or(eyre!("home dir not found!"))?
-        .join(".config/rmrf/rmrf.cfg");
+    let rmrf_cfg_path = rmrf_cfg_home(
+        current_uid(),
+        env::var("SUDO_USER").ok().as_deref(),
+        passwd_home,
+        dirs::home_dir(),
+    )?
+    .join(".config/rmrf/rmrf.cfg");
     debug!("Configuration file path: {:?}", rmrf_cfg_path);
 
-    let mut rmrf_cfg = Ini::new();
-    rmrf_cfg
-        .load(&rmrf_cfg_path)
-        .map_err(|e| eyre!(e))
-        .wrap_err("Failed to load config")?;
+    let rmrf_cfg = load_rmrf_cfg(&rmrf_cfg_path)?;
     debug!("Configuration loaded: {:?}", rmrf_cfg);
 
     let rmrf_path = rmrf_cfg
@@ -1512,5 +1624,136 @@ archive_location: "/tmp/integration_test"
         // Both directories should be deleted with 0 day threshold
         assert!(!old_dir.exists(), "Old directory should be removed");
         assert!(!recent_dir.exists(), "Directory should be removed with 0 day threshold");
+    }
+
+    #[test]
+    fn rmrf_cfg_missing_returns_defaults() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join(".config/rmrf/rmrf.cfg");
+
+        let ini = load_rmrf_cfg(&path).expect("a missing rmrf.cfg must load as defaults");
+        assert!(
+            ini.sections().is_empty(),
+            "expected an empty Ini, got {:?}",
+            ini.sections()
+        );
+        assert_eq!(ini.get("DEFAULT", "rmrf_path"), None);
+    }
+
+    #[test]
+    fn rmrf_cfg_present_file_is_read() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("rmrf.cfg");
+        fs::write(&path, "rmrf_path=/x/rmrf\nsudo=no\nkeep=21\n").unwrap();
+
+        let ini = load_rmrf_cfg(&path).unwrap();
+        assert_eq!(ini.get("DEFAULT", "rmrf_path").as_deref(), Some("/x/rmrf"));
+        assert_eq!(ini.get("DEFAULT", "sudo").as_deref(), Some("no"));
+        assert_eq!(ini.get("DEFAULT", "keep").as_deref(), Some("21"));
+    }
+
+    #[test]
+    fn rmrf_cfg_unreadable_is_error() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            current_uid(),
+            0,
+            "running as root: root reads a 0000 file, so this test would pass vacuously"
+        );
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("rmrf.cfg");
+        fs::write(&path, "sudo=no\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = load_rmrf_cfg(&path).expect_err("an unreadable rmrf.cfg must be an error");
+        assert!(
+            format!("{:#}", err).contains(&path.display().to_string()),
+            "error should name the path: {:#}",
+            err
+        );
+    }
+
+    #[test]
+    fn rmrf_cfg_dangling_symlink_is_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("rmrf.cfg");
+        symlink(temp_dir.path().join("missing-target.cfg"), &path).unwrap();
+
+        let err = load_rmrf_cfg(&path).expect_err("a dangling rmrf.cfg symlink must be an error");
+        assert!(
+            format!("{:#}", err).contains(&path.display().to_string()),
+            "error should name the path: {:#}",
+            err
+        );
+    }
+
+    fn lookup_never(_: &str) -> Result<Option<PathBuf>> {
+        panic!("lookup must not be called");
+    }
+
+    #[test]
+    fn rmrf_cfg_home_uses_sudo_user_when_root() {
+        let home = rmrf_cfg_home(
+            0,
+            Some("alice"),
+            |user| {
+                assert_eq!(user, "alice");
+                Ok(Some(PathBuf::from("/home/alice")))
+            },
+            Some(PathBuf::from("/root")),
+        )
+        .unwrap();
+        assert_eq!(home, PathBuf::from("/home/alice"));
+    }
+
+    #[test]
+    fn rmrf_cfg_home_ignores_sudo_user_when_not_root() {
+        let home = rmrf_cfg_home(1000, Some("alice"), lookup_never, Some(PathBuf::from("/home/me"))).unwrap();
+        assert_eq!(home, PathBuf::from("/home/me"));
+    }
+
+    #[test]
+    fn rmrf_cfg_home_ignores_sudo_user_root() {
+        let home = rmrf_cfg_home(0, Some("root"), lookup_never, Some(PathBuf::from("/root"))).unwrap();
+        assert_eq!(home, PathBuf::from("/root"));
+    }
+
+    #[test]
+    fn rmrf_cfg_home_without_sudo_user_and_no_fallback_is_error() {
+        let err = rmrf_cfg_home(0, None, lookup_never, None).unwrap_err();
+        assert!(err.to_string().contains("home dir not found"), "{}", err);
+    }
+
+    #[test]
+    fn rmrf_cfg_home_unknown_sudo_user_is_error() {
+        let err = rmrf_cfg_home(0, Some("ghost"), |_| Ok(None), Some(PathBuf::from("/root"))).unwrap_err();
+        assert_eq!(err.to_string(), "SUDO_USER=ghost has no passwd entry");
+    }
+
+    #[test]
+    fn rmrf_cfg_home_lookup_error_propagates() {
+        let err = rmrf_cfg_home(
+            0,
+            Some("alice"),
+            |_| Err(eyre!("nss exploded")),
+            Some(PathBuf::from("/root")),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "nss exploded");
+    }
+
+    #[test]
+    fn rmrf_cfg_passwd_home_root() {
+        assert_eq!(passwd_home("root").unwrap(), Some(PathBuf::from("/root")));
+    }
+
+    #[test]
+    fn rmrf_cfg_passwd_home_unknown_user_is_none() {
+        assert_eq!(passwd_home("rkvr-no-such-user-zz9").unwrap(), None);
+    }
+
+    #[test]
+    fn rmrf_cfg_passwd_home_nul_in_name_is_error() {
+        assert!(passwd_home("ro\0ot").is_err());
     }
 }
